@@ -395,6 +395,16 @@ pub struct BackgroundTask {
     /// unchanged; `None` preserves the legacy derivation bit-for-bit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
+    /// #1595: first-class relaunch lineage — the predecessor task id when
+    /// this task was created by [`TaskSupervisor::relaunch`]. The relaunch
+    /// path also stamps the edge into `runtime_detail` JSON for the spawn
+    /// transition, but the next `mark_runtime_state` overwrite drops that
+    /// JSON; this dedicated field survives every later transition, so
+    /// `task/updated` frames can carry the chain explicitly on every tick.
+    /// `#[serde(default)]` so pre-existing persisted snapshots deserialize
+    /// as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaunched_from: Option<String>,
 }
 
 impl BackgroundTask {
@@ -1781,6 +1791,21 @@ impl TaskSupervisor {
             .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
     }
 
+    /// #2353 — liveness probe for the SHARED `on_restore` slot, so a test can
+    /// assert the supervisor's inner state is actually reclaimed once every
+    /// external owner drops (i.e. no observer callback is pinning it through
+    /// a captured strong clone). Detects leaks that pin the slot's `Arc`
+    /// itself — the structural-clone cycle shape; a capture of an individual
+    /// inner `Arc` would need its own probe. Returns a closure because the
+    /// slot type is private.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn on_restore_slot_alive_probe_for_test(
+        &self,
+    ) -> impl Fn() -> bool + Send + Sync + 'static {
+        let weak = std::sync::Arc::downgrade(&self.on_restore);
+        move || weak.upgrade().is_some()
+    }
+
     /// #2056 round 3 — THE install path for the restore observer, shared by
     /// [`Self::set_on_restore`] and observer inheritance so neither can bypass
     /// the missed-restore handshake. Installing and taking the pending mark
@@ -2077,6 +2102,22 @@ impl TaskSupervisor {
             "from_node": opts.from_node,
         })
         .to_string();
+        // #1595: also record the edge on the durable first-class field
+        // BEFORE the runtime-state stamp below — the spawn snapshot that
+        // `mark_runtime_state` persists then carries the lineage, and the
+        // field survives the `runtime_detail` overwrite on every later
+        // transition. Note the register above already persisted a
+        // lineage-less snapshot; that placeholder is superseded here by a
+        // strictly-newer `updated_at` (so `task_snapshot_advances` lets
+        // this snapshot win on restore), and the successor's first
+        // UI-visible frame is the `mark_runtime_state` emit below, which
+        // carries the field.
+        {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(task) = tasks.get_mut(&new_task_id) {
+                task.relaunched_from = Some(task_id.to_string());
+            }
+        }
         self.mark_runtime_state(&new_task_id, TaskRuntimeState::Spawned, Some(detail));
 
         let request = RelaunchRequest {
@@ -2686,6 +2727,9 @@ impl TaskSupervisor {
             workspace_root: workspace_scope
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned),
+            // Set by `relaunch` post-registration when the task is a
+            // relaunch successor; plain registrations have no predecessor.
+            relaunched_from: None,
         };
         // Read configuration before locking the task table: enable_persistence
         // may consult the task table while holding the configuration lock.
@@ -4108,27 +4152,36 @@ impl TaskSupervisor {
     ///
     /// Idempotent: only the first call spawns the loop; later calls are
     /// no-ops (the flag is shared across `Clone`s). The loop holds only
-    /// a weak liveness story — it keeps running as long as the process
-    /// does; dropping the supervisor's last clone does not stop the
-    /// spawned task until the runtime shuts down (acceptable: the
-    /// production supervisor lives for the process lifetime).
+    /// a `Weak` self-reference and upgrades per tick (#1930): when the
+    /// owning session actor drops the last external `Arc` (session
+    /// deleted or idled out), the next tick's upgrade fails and the loop
+    /// exits instead of pinning the supervisor until process shutdown.
+    /// The upgrade is never held across the sleep, so an in-flight tick
+    /// does not defer the drop either.
     pub fn start_reaper(self: &Arc<Self>) {
         if self.reaper_started.swap(true, Ordering::SeqCst) {
             return;
         }
-        let supervisor = Arc::clone(self);
+        let supervisor = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
-                let interval = *supervisor
+                let Some(strong) = supervisor.upgrade() else {
+                    break;
+                };
+                let interval = *strong
                     .reap_interval
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+                drop(strong);
                 tokio::time::sleep(interval).await;
-                let timeout = *supervisor
+                let Some(strong) = supervisor.upgrade() else {
+                    break;
+                };
+                let timeout = *strong
                     .stuck_timeout
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                supervisor.reap_stuck_tasks(Utc::now(), timeout);
+                strong.reap_stuck_tasks(Utc::now(), timeout);
             }
         });
     }

@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::router::AuthIdentity;
 use super::{AppState, ominix_runtime};
-use crate::profiles::{ProfileConfig, UserProfile, mask_secrets};
+use crate::profiles::{ProfileConfig, ProfileStore, UserProfile, mask_secrets};
 
 const DEFAULT_SERVE_LOG_TAIL_N: usize = 200;
 const MAX_SERVE_LOG_TAIL_N: usize = 5_000;
@@ -277,6 +277,13 @@ pub async fn get_profile(
 /// declared `VERTEX_SA_JSON` name — so a private key pasted under a custom env
 /// var (e.g. a dashboard "Custom" provider deriving `VERTEX_API_KEY`) can't slip
 /// past into plaintext config.
+///
+/// Relocation is per key and short-circuits on the first failure: keys
+/// already relocated stay in the keychain when a later key fails. Those
+/// entries are scoped per profile id, so they cannot leak across accounts,
+/// and a same-id retry (after the caller's profile rollback) overwrites
+/// them — recording the semantics rather than adding a cleanup pass,
+/// matching `delete_profile`'s keychain behavior (#2316).
 pub(crate) fn relocate_keychain_backed_secrets(
     env_vars: &mut std::collections::HashMap<String, String>,
     profile_id: &str,
@@ -1851,6 +1858,107 @@ pub(crate) fn validate_channel_credentials(
     Ok(())
 }
 
+/// The secret-relocation hook applied to a profile's env vars before they are
+/// persisted — the signature of [`relocate_keychain_backed_secrets`]. Carried
+/// as a parameter so tests can drive the failure path without writing to the
+/// developer's keychain.
+pub(crate) type RelocateSecretsHook =
+    fn(&mut std::collections::HashMap<String, String>, &str) -> Result<(), (StatusCode, String)>;
+
+/// Roll back a just-created sub-account profile after a post-persist
+/// creation step failed: the store saved the profile before these steps ran,
+/// so deleting its registry record keeps the id retryable instead of
+/// stranding it behind "already exists" when the same request is retried
+/// (#1472, #2316). A rollback failure is logged, never reported over the
+/// original error.
+pub(crate) fn rollback_sub_account(store: &ProfileStore, sub_id: &str) {
+    if let Err(rollback) = store.delete(sub_id) {
+        tracing::error!(
+            profile = %sub_id,
+            error = %rollback,
+            "failed to roll back sub-account after creation failure"
+        );
+    }
+}
+
+/// Apply freshly supplied sub-account env vars, relocating keychain-backed
+/// secrets (e.g. the Vertex SA JSON) into the OS keychain before the save so a
+/// sub-account never writes a private key to plaintext config. The store has
+/// already persisted the fresh profile by the time this runs, so a failure —
+/// relocation or the final save — rolls the profile back: otherwise the API
+/// would report "creation failed" while leaving a sub-account whose id can
+/// never be retried ("already exists", #1472, #2316).
+pub(crate) fn apply_sub_account_env_vars(
+    store: &ProfileStore,
+    sub: &mut UserProfile,
+    env_vars: std::collections::HashMap<String, String>,
+    relocate: RelocateSecretsHook,
+) -> Result<(), (StatusCode, String)> {
+    sub.config.env_vars = env_vars;
+    let sub_id = sub.id.clone();
+    if let Err(e) = relocate(&mut sub.config.env_vars, &sub_id) {
+        // Roll the just-created profile back: the sub-account was saved
+        // keychain-less moments ago and nothing else references it yet, so
+        // removing it restores the pre-request state instead of stranding a
+        // half-configured id behind "already exists".
+        rollback_sub_account(store, &sub.id);
+        return Err(e);
+    }
+    sub.updated_at = Utc::now();
+    if let Err(e) = store.save(sub) {
+        // Same stranded-id shape: the env-less profile is already on disk,
+        // so a failed save must not leave it behind either.
+        rollback_sub_account(store, &sub.id);
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
+    Ok(())
+}
+
+/// Create the User entry that lets a fresh sub-account log in via OTP. Runs
+/// after the profile store has persisted the sub-account, so every failure
+/// (invalid email, already-registered email, user-store save) rolls the
+/// profile back — otherwise the request reports an error while the
+/// sub-account id stays on disk, unretryable behind "already exists" (#2316).
+pub(crate) fn create_sub_account_user_entry(
+    state: &AppState,
+    store: &ProfileStore,
+    sub: &UserProfile,
+    email: &str,
+) -> Result<(), (StatusCode, String)> {
+    let email = email.trim().to_lowercase();
+    if email.is_empty() {
+        return Ok(());
+    }
+    let outcome = (|| -> Result<(), (StatusCode, String)> {
+        validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        if let Some(user_store) = state.user_store.as_ref() {
+            // Check if email is already taken
+            if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("Email '{email}' is already registered to another account"),
+                ));
+            }
+            let user = crate::user_store::User {
+                id: sub.id.clone(),
+                email: email.clone(),
+                name: sub.name.clone(),
+                role: crate::user_store::UserRole::User,
+                created_at: Utc::now(),
+                last_login_at: None,
+            };
+            user_store
+                .save(&user)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        Ok(())
+    })();
+    if outcome.is_err() {
+        rollback_sub_account(store, &sub.id);
+    }
+    outcome
+}
+
 /// POST /api/admin/profiles/:id/accounts — Create a sub-account.
 pub async fn create_sub_account(
     State(state): State<Arc<AppState>>,
@@ -1884,43 +1992,17 @@ pub async fn create_sub_account(
 
     // Set channel-specific env vars if provided
     if !req.env_vars.is_empty() {
-        sub.config.env_vars = req.env_vars;
-        // Relocate keychain-backed secrets (e.g. the Vertex SA JSON) before
-        // persisting so a sub-account never writes a private key to disk.
-        let sub_id = sub.id.clone();
-        relocate_keychain_backed_secrets(&mut sub.config.env_vars, &sub_id)?;
-        sub.updated_at = Utc::now();
-        store
-            .save(&sub)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        apply_sub_account_env_vars(
+            store,
+            &mut sub,
+            req.env_vars,
+            relocate_keychain_backed_secrets,
+        )?;
     }
 
     // Create a User entry so the sub-account can log in via OTP
     if let Some(email) = &req.email {
-        let email = email.trim().to_lowercase();
-        if !email.is_empty() {
-            validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-            if let Some(user_store) = state.user_store.as_ref() {
-                // Check if email is already taken
-                if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        format!("Email '{email}' is already registered to another account"),
-                    ));
-                }
-                let user = crate::user_store::User {
-                    id: sub.id.clone(),
-                    email,
-                    name: sub.name.clone(),
-                    role: crate::user_store::UserRole::User,
-                    created_at: Utc::now(),
-                    last_login_at: None,
-                };
-                user_store
-                    .save(&user)
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            }
-        }
+        create_sub_account_user_entry(&state, store, &sub, email)?;
     }
 
     let status = pm.status(&sub.id).await;
@@ -2949,16 +3031,21 @@ pub async fn platform_service_logs(
         .unwrap_or(50)
         .min(200);
 
-    let home = std::env::var("HOME").unwrap_or_default();
-    // Try both common log file names
-    let log_path = {
-        let p1 = format!("{home}/.ominix/api.log");
-        let p2 = format!("{home}/.ominix/ominix-api.log");
-        if std::path::Path::new(&p1).exists() {
-            p1
-        } else {
-            p2
-        }
+    // Match the runtime's home resolution (api/ominix_runtime.rs): a custom
+    // OCTOS_OMINIX_HOME relocates the whole OMiniX home, logs included.
+    let home = std::env::var_os("OCTOS_OMINIX_HOME")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_default();
+    let (log_path, err_log_path) = platform_service_log_paths(&home);
+
+    // The launchd plist routes stderr (startup failures, panics) to a
+    // separate api.err.log; surface it alongside the main log or bind
+    // failures and early crashes never reach the dashboard.
+    let (err_total_lines, err_lines) = match tokio::fs::read_to_string(&err_log_path).await {
+        Ok(c) => (c.lines().count(), last_lines(&c, lines)),
+        Err(_) => (0, Vec::new()),
     };
 
     let content = match tokio::fs::read_to_string(&log_path).await {
@@ -2968,18 +3055,46 @@ pub async fn platform_service_logs(
                 "log_path": log_path,
                 "error": format!("Cannot read log file: {e}"),
                 "lines": [],
+                "err_log_path": err_log_path,
+                "err_total_lines": err_total_lines,
+                "err_lines": err_lines,
             })));
         }
     };
 
-    let log_lines: Vec<&str> = content.lines().rev().take(lines).collect();
-    let log_lines: Vec<&str> = log_lines.into_iter().rev().collect();
-
     Ok(Json(serde_json::json!({
         "log_path": log_path,
         "total_lines": content.lines().count(),
-        "lines": log_lines,
+        "lines": last_lines(&content, lines),
+        "err_log_path": err_log_path,
+        "err_total_lines": err_total_lines,
+        "err_lines": err_lines,
     })))
+}
+
+/// Main and stderr log paths under the OMiniX home. Prefers `api.log`,
+/// falling back to the legacy `ominix-api.log` name.
+fn platform_service_log_paths(home: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = home.join(".ominix");
+    let primary = dir.join("api.log");
+    let main = if primary.exists() {
+        primary
+    } else {
+        dir.join("ominix-api.log")
+    };
+    (main, dir.join("api.err.log"))
+}
+
+fn last_lines(content: &str, n: usize) -> Vec<String> {
+    content
+        .lines()
+        .rev()
+        .take(n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(str::to_string)
+        .collect()
 }
 
 // ── Model Management (proxy to ominix-api) ─────────────────────────
@@ -5632,6 +5747,359 @@ mod tests {
         }
     }
 
+    // #1472 test fixture: a persisted parent profile plus a fresh (already
+    // saved, env-less) sub-account, i.e. the state `create_sub_account`
+    // handlers have when they reach the env-var step.
+    fn parent_profile() -> UserProfile {
+        UserProfile {
+            id: "parent".into(),
+            name: "Parent".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn fresh_sub_account_with_parent(store: &ProfileStore) -> UserProfile {
+        store.save(&parent_profile()).unwrap();
+        store
+            .create_sub_account(
+                "parent",
+                "sub1",
+                "sub1",
+                "Sub",
+                vec![],
+                crate::profiles::GatewaySettings::default(),
+            )
+            .unwrap()
+    }
+
+    // #1472: the store has already persisted the fresh sub-account when a
+    // keychain-backed secret fails to relocate (raw Vertex SA JSON on a host
+    // with no secret store, or a keychain write error) — the failed creation
+    // must roll the profile back so retrying the same id doesn't hit
+    // "already exists".
+    #[test]
+    fn should_roll_back_fresh_sub_account_when_secret_relocation_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let mut sub = fresh_sub_account_with_parent(&store);
+        let sub_id = sub.id.clone();
+
+        let res = apply_sub_account_env_vars(
+            &store,
+            &mut sub,
+            std::collections::HashMap::from([(
+                "VERTEX_SA_JSON".to_string(),
+                r#"{"type":"service_account","private_key":"x"}"#.to_string(),
+            )]),
+            |_env_vars, _profile_id| {
+                Err((
+                    StatusCode::BAD_REQUEST,
+                    "VERTEX_SA_JSON: keychain-backed credential storage is unavailable".into(),
+                ))
+            },
+        );
+
+        assert_eq!(res.unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert!(
+            store.get(&sub_id).unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+        store
+            .create_sub_account(
+                "parent",
+                "sub1",
+                "sub1",
+                "Sub",
+                vec![],
+                crate::profiles::GatewaySettings::default(),
+            )
+            .expect("retrying the same id must succeed after the rollback");
+    }
+
+    // #2316: the final `store.save` failing AFTER a successful relocation is
+    // the same stranded-id shape — the env-less profile persisted by the
+    // caller must be rolled back so the id stays retryable. A directory at
+    // the temp file's path makes `fs::write` fail on every platform (Unix
+    // EISDIR / Windows ERROR_ACCESS_DENIED), while the rollback's delete of
+    // the registry JSON stays functional.
+    #[test]
+    fn should_roll_back_fresh_sub_account_when_final_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let mut sub = fresh_sub_account_with_parent(&store);
+        let sub_id = sub.id.clone();
+        let blocker = dir
+            .path()
+            .join("profiles")
+            .join(format!("{sub_id}.json.tmp"));
+        std::fs::create_dir(&blocker).unwrap();
+
+        let res = apply_sub_account_env_vars(
+            &store,
+            &mut sub,
+            std::collections::HashMap::from([("SOME_TOKEN".to_string(), "x".to_string())]),
+            |_env_vars, _profile_id| Ok(()),
+        );
+
+        assert_eq!(res.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            store.get(&sub_id).unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+        std::fs::remove_dir(&blocker).unwrap();
+        store
+            .create_sub_account(
+                "parent",
+                "sub1",
+                "sub1",
+                "Sub",
+                vec![],
+                crate::profiles::GatewaySettings::default(),
+            )
+            .expect("retrying the same id must succeed after the rollback");
+    }
+
+    // The happy path is unchanged: benign env vars (nothing needing
+    // relocation) pass through the production relocate hook untouched and are
+    // persisted on the sub-account.
+    #[test]
+    fn should_persist_env_vars_when_nothing_needs_relocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let mut sub = fresh_sub_account_with_parent(&store);
+        let sub_id = sub.id.clone();
+
+        let res = apply_sub_account_env_vars(
+            &store,
+            &mut sub,
+            std::collections::HashMap::from([("DEPLOY_ENV".to_string(), "production".to_string())]),
+            relocate_keychain_backed_secrets,
+        );
+
+        assert!(res.is_ok());
+        let saved = store.get(&sub_id).unwrap().expect("sub-account persisted");
+        assert_eq!(
+            saved.config.env_vars.get("DEPLOY_ENV").map(String::as_str),
+            Some("production")
+        );
+    }
+
+    // #1472 wiring: the admin create path routes env vars through the shared
+    // helper — benign vars (nothing to relocate) still land on the saved
+    // sub-account.
+    #[tokio::test]
+    async fn should_create_sub_account_with_env_vars_via_admin_handler() {
+        use crate::api::AppState;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
+        let state = AppState {
+            profile_store: Some(profile_store.clone()),
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            ..AppState::empty_for_tests()
+        };
+        profile_store.save(&parent_profile()).unwrap();
+
+        let (status, Json(resp)) = create_sub_account(
+            axum::extract::State(Arc::new(state)),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(CreateSubAccountRequest {
+                sub_account_id: "sub1".into(),
+                name: "Sub".into(),
+                public_subdomain: "sub1".into(),
+                email: None,
+                channels: vec![],
+                gateway: None,
+                env_vars: std::collections::HashMap::from([(
+                    "DEPLOY_ENV".to_string(),
+                    "production".to_string(),
+                )]),
+            }),
+        )
+        .await
+        .expect("creation succeeds");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.profile.id, "parent--sub1");
+        let saved = profile_store
+            .get("parent--sub1")
+            .unwrap()
+            .expect("sub-account persisted");
+        assert_eq!(
+            saved.config.env_vars.get("DEPLOY_ENV").map(String::as_str),
+            Some("production")
+        );
+    }
+
+    // #2316 test fixture: an AppState wired like the admin create handler
+    // needs it — profile store, process manager, and a user store.
+    fn sub_account_state(
+        dir: &tempfile::TempDir,
+    ) -> (
+        Arc<AppState>,
+        Arc<ProfileStore>,
+        Arc<crate::user_store::UserStore>,
+    ) {
+        use crate::api::AppState;
+        use std::sync::Arc;
+
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
+        let user_store = Arc::new(crate::user_store::UserStore::open(dir.path()).unwrap());
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store.clone()),
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            user_store: Some(user_store.clone()),
+            ..AppState::empty_for_tests()
+        });
+        (state, profile_store, user_store)
+    }
+
+    fn sub_account_request(email: Option<&str>) -> CreateSubAccountRequest {
+        CreateSubAccountRequest {
+            sub_account_id: "sub1".into(),
+            name: "Sub".into(),
+            public_subdomain: "sub1".into(),
+            email: email.map(str::to_string),
+            channels: vec![],
+            gateway: None,
+            env_vars: std::collections::HashMap::new(),
+        }
+    }
+
+    // #2316: the email-conflict 409 fires after the profile store has
+    // persisted the fresh sub-account — the failed creation must roll the
+    // profile back so retrying the same id doesn't hit "already exists".
+    #[tokio::test]
+    async fn should_roll_back_fresh_sub_account_when_email_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, profile_store, user_store) = sub_account_state(&dir);
+        profile_store.save(&parent_profile()).unwrap();
+        user_store
+            .save(&crate::user_store::User {
+                id: "other".into(),
+                email: "taken@example.com".into(),
+                name: "Other".into(),
+                role: crate::user_store::UserRole::User,
+                created_at: Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let err = create_sub_account(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("taken@example.com"))),
+        )
+        .await
+        .err()
+        .expect("creation must fail");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(
+            profile_store.get("parent--sub1").unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+
+        let (status, _) = create_sub_account(
+            axum::extract::State(state),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("fresh@example.com"))),
+        )
+        .await
+        .expect("retrying the same id must succeed after the rollback");
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            user_store.get("parent--sub1").unwrap().is_some(),
+            "the user entry lands on the successful retry"
+        );
+    }
+
+    // #2316: an invalid email (BAD_REQUEST) is a post-persist failure too —
+    // same rollback, same retryable id.
+    #[tokio::test]
+    async fn should_roll_back_fresh_sub_account_when_email_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, profile_store, _user_store) = sub_account_state(&dir);
+        profile_store.save(&parent_profile()).unwrap();
+
+        let err = create_sub_account(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("not-an-email"))),
+        )
+        .await
+        .err()
+        .expect("creation must fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            profile_store.get("parent--sub1").unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+
+        let (status, _) = create_sub_account(
+            axum::extract::State(state),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(None)),
+        )
+        .await
+        .expect("retrying the same id must succeed after the rollback");
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    // #2316: a user-store save failure (500) is the third post-persist
+    // failure shape. Blocking the user file's path with a directory makes
+    // the atomic rename fail deterministically while the profile store
+    // stays writable, so the rollback can still delete the sub-account.
+    #[tokio::test]
+    async fn should_roll_back_fresh_sub_account_when_user_store_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, profile_store, user_store) = sub_account_state(&dir);
+        profile_store.save(&parent_profile()).unwrap();
+        let blocker = dir.path().join("users").join("parent--sub1.json");
+        std::fs::create_dir(&blocker).unwrap();
+
+        let err = create_sub_account(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("new@example.com"))),
+        )
+        .await
+        .err()
+        .expect("creation must fail");
+
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            profile_store.get("parent--sub1").unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+
+        std::fs::remove_dir(&blocker).unwrap();
+        let (status, _) = create_sub_account(
+            axum::extract::State(state),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("new@example.com"))),
+        )
+        .await
+        .expect("retrying the same id must succeed after the rollback");
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            user_store.get("parent--sub1").unwrap().is_some(),
+            "the user entry lands once the save blocker is gone"
+        );
+    }
+
     #[test]
     fn shell_request_deserialize_minimal() {
         let json = r#"{"command": "echo hello"}"#;
@@ -5862,6 +6330,8 @@ mod tests {
         assert_eq!(state.pending, "partial");
     }
 
+    // admin_shell hardcodes `sh -c`; the happy-path tests need a Unix shell.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_echo_command() {
         let req = ShellRequest {
@@ -5897,6 +6367,7 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_captures_stderr() {
         let req = ShellRequest {
@@ -5909,6 +6380,7 @@ mod tests {
         assert_eq!(result.exit_code, 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_nonzero_exit_code() {
         let req = ShellRequest {
@@ -5920,6 +6392,7 @@ mod tests {
         assert_eq!(result.exit_code, 42);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_timeout() {
         let req = ShellRequest {
@@ -6141,6 +6614,157 @@ mod tests {
         assert!(input.output_files.is_empty());
         assert!(input.runtime_state.is_none());
     }
+
+    #[test]
+    fn platform_service_log_paths_prefer_api_log_and_point_at_err_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let ominix = dir.path().join(".ominix");
+        std::fs::create_dir_all(&ominix).unwrap();
+
+        // No api.log yet ⇒ legacy name.
+        let (main, err) = platform_service_log_paths(dir.path());
+        assert_eq!(main, ominix.join("ominix-api.log"));
+        assert_eq!(err, ominix.join("api.err.log"));
+
+        std::fs::write(ominix.join("api.log"), "out\n").unwrap();
+        let (main, err) = platform_service_log_paths(dir.path());
+        assert_eq!(main, ominix.join("api.log"));
+        assert_eq!(err, ominix.join("api.err.log"));
+    }
+
+    #[test]
+    fn last_lines_returns_the_tail_in_order_capped() {
+        let content = "one\ntwo\nthree\n";
+        assert_eq!(last_lines(content, 2), vec!["two", "three"]);
+        assert_eq!(last_lines(content, 50), vec!["one", "two", "three"]);
+        assert!(last_lines("", 5).is_empty());
+    }
+
+    /// With a custom `OCTOS_OMINIX_HOME`, the logs endpoint must read the
+    /// main log from the relocated home and surface the plist's stderr
+    /// log (`api.err.log`) alongside it.
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    // The env must stay pivoted for the duration of the handler call, so the
+    // serializing lock is intentionally held across the await (test-only).
+    #[allow(clippy::await_holding_lock)]
+    async fn platform_service_logs_reads_custom_home_and_surfaces_err_log() {
+        use crate::config_context::TEST_ENV_LOCK;
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let custom = tempfile::tempdir().unwrap();
+        let default_home = tempfile::tempdir().unwrap();
+        let ominix = custom.path().join(".ominix");
+        std::fs::create_dir_all(&ominix).unwrap();
+        std::fs::write(ominix.join("api.log"), "boot ok\nserving\n").unwrap();
+        std::fs::write(ominix.join("api.err.log"), "panic: bind failed\n").unwrap();
+
+        let keys = ["OCTOS_OMINIX_HOME", "HOME"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("OCTOS_OMINIX_HOME", custom.path());
+            std::env::set_var("HOME", default_home.path());
+        }
+        let result =
+            platform_service_logs(axum::extract::Query(std::collections::HashMap::new())).await;
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+
+        let Json(body) = result.expect("logs handler responds");
+        assert_eq!(body["lines"], serde_json::json!(["boot ok", "serving"]));
+        assert_eq!(body["total_lines"], 2);
+        assert_eq!(body["err_lines"], serde_json::json!(["panic: bind failed"]));
+        assert_eq!(body["err_total_lines"], 1);
+        assert!(body.get("error").is_none());
+    }
+
+    /// The exact startup-failure scenario: the daemon never wrote its main
+    /// log, but the plist captured stderr. The endpoint must still surface
+    /// `api.err.log` from the error arm.
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    #[allow(clippy::await_holding_lock)] // see the happy-path test above
+    async fn platform_service_logs_surfaces_err_log_when_main_log_missing() {
+        use crate::config_context::TEST_ENV_LOCK;
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let custom = tempfile::tempdir().unwrap();
+        let default_home = tempfile::tempdir().unwrap();
+        let ominix = custom.path().join(".ominix");
+        std::fs::create_dir_all(&ominix).unwrap();
+        std::fs::write(ominix.join("api.err.log"), "panic: bind failed\n").unwrap();
+
+        let keys = ["OCTOS_OMINIX_HOME", "HOME"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("OCTOS_OMINIX_HOME", custom.path());
+            std::env::set_var("HOME", default_home.path());
+        }
+        let result =
+            platform_service_logs(axum::extract::Query(std::collections::HashMap::new())).await;
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+
+        let Json(body) = result.expect("logs handler responds");
+        assert_eq!(body["lines"], serde_json::json!([]));
+        assert!(body.get("error").is_some());
+        assert_eq!(body["err_lines"], serde_json::json!(["panic: bind failed"]));
+        assert_eq!(body["err_total_lines"], 1);
+    }
+
+    // #1440: a WeChat QR flow started against a profile that does not exist
+    // must fail fast instead of reporting "confirmed" with the token dropped.
+    #[tokio::test]
+    async fn wechat_qr_start_rejects_unknown_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store),
+            ..AppState::empty_for_tests()
+        });
+
+        let status = match wechat_qr_start(State(state), Path("ghost".into())).await {
+            Err((status, _)) => status,
+            Ok(_) => panic!("unknown profile must be rejected"),
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn wechat_qr_poll_rejects_unknown_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store),
+            ..AppState::empty_for_tests()
+        });
+
+        let status = match wechat_qr_poll(
+            State(state),
+            Path("ghost".into()),
+            Json(WeChatQrPollRequest {
+                session_key: "sk-1".into(),
+            }),
+        )
+        .await
+        {
+            Err((status, _)) => status,
+            Ok(_) => panic!("unknown profile must be rejected"),
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6155,9 +6779,13 @@ pub struct WeChatQrStartResponse {
 
 /// GET /api/admin/profiles/{id}/wechat/qr-start
 pub async fn wechat_qr_start(
-    State(_state): State<Arc<AppState>>,
-    Path(_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
 ) -> Result<Json<WeChatQrStartResponse>, (StatusCode, String)> {
+    // Fail fast before the user scans a QR bound for a profile that does not
+    // exist — the poll below would have nowhere to land the token.
+    require_admin_profile(&state, &id)?;
+
     let client = reqwest::Client::new();
     let url = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3";
     let resp = client
@@ -6198,12 +6826,31 @@ pub struct WeChatQrPollResponse {
     pub bot_id: Option<String>,
 }
 
+/// Load the named profile or fail the request: a QR flow for a profile that
+/// does not exist would report "confirmed" while the token lands nowhere.
+fn require_admin_profile(
+    state: &Arc<AppState>,
+    id: &str,
+) -> Result<Arc<crate::profiles::ProfileStore>, (StatusCode, String)> {
+    let store = state.profile_store.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    store
+        .get(id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
+    Ok(store)
+}
+
 /// POST /api/admin/profiles/{id}/wechat/qr-poll
 pub async fn wechat_qr_poll(
     State(state): State<Arc<AppState>>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     Json(req): Json<WeChatQrPollRequest>,
 ) -> Result<Json<WeChatQrPollResponse>, (StatusCode, String)> {
+    let store = require_admin_profile(&state, &id)?;
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(40))
         .build()
@@ -6250,27 +6897,8 @@ pub async fn wechat_qr_poll(
             .unwrap_or_default()
             .to_string();
 
-        // Save token to profile
-        if !bot_token.is_empty() {
-            if let Some(_pm) = state.process_manager.as_ref() {
-                // Write token with restrictive permissions from the start (no TOCTOU race)
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let _ = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open("/tmp/octos-wechat-token")
-                        .and_then(|mut f| std::io::Write::write_all(&mut f, bot_token.as_bytes()));
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::write("/tmp/octos-wechat-token", &bot_token).ok();
-                }
-            }
-        }
+        // Save token to the profile being edited
+        super::auth_handlers::persist_wechat_bot_token(&store, &id, &bot_token);
 
         // Don't expose bot_token to the client — it's already saved server-side
         return Ok(Json(WeChatQrPollResponse {

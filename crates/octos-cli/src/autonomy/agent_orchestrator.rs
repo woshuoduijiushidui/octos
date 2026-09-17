@@ -1741,17 +1741,29 @@ pub(crate) fn install_peer_restore_observers_composed(
 /// already-adopted (Completed) row is skipped rather than re-marked terminal.
 /// Ungated: the gateway session actor (which owns the supervisor peer tasks
 /// register against) wires it WITHOUT the `api` feature.
+///
+/// #2353 — takes the supervisor behind its `Arc` so the composed consumer can
+/// capture a `Weak` and upgrade at fire time: a strong structural clone
+/// stored back into the supervisor's own `on_restore` slot would cycle
+/// (slot → closure → clone → the same slot) and pin the session's entire
+/// inner supervisor state until process shutdown. When the upgrade fails the
+/// session is gone, and there is nothing left to adopt or reconcile for, so
+/// the callback simply no-ops. The same applies to child supervisors that
+/// INHERIT the composed callback ([`octos_agent::TaskSupervisor::
+/// inherit_registration_observers`], e.g. the `snapshot_excluding` path): a
+/// child restoring after the parent's last owner dropped skips the adoption
+/// half, while the goal-reconcile half still runs over the child's own
+/// restored rows.
 pub(crate) fn install_peer_restore_observers_resolving_at_callback(
-    supervisor: &octos_agent::TaskSupervisor,
+    supervisor: &Arc<octos_agent::TaskSupervisor>,
     session_id: &SessionKey,
     profile_id: &str,
     profile_data_dir: &Path,
 ) {
-    let adoption_supervisor = supervisor.clone();
+    let restore_supervisor = Arc::downgrade(supervisor);
     let adoption_data_dir = profile_data_dir.to_path_buf();
     let adoption_profile = profile_id.to_owned();
     let adoption_master_session = session_id.to_string();
-    let reconcile_supervisor = supervisor.clone();
     install_goal_task_row_observers_resolving_at_callback_composed(
         supervisor,
         session_id,
@@ -1771,12 +1783,17 @@ pub(crate) fn install_peer_restore_observers_resolving_at_callback(
         // API needed), where the adopted rows are terminal with bindings
         // intact.
         Some(Box::new(move |_restored| {
+            let Some(supervisor) = restore_supervisor.upgrade() else {
+                // #2353 — the session's supervisor is gone; the parked rows it
+                // would have adopted went with it.
+                return;
+            };
             crate::peers::adopt_parked_peer_tasks_with_results(
-                &adoption_supervisor,
+                &supervisor,
                 &adoption_profile,
                 &adoption_master_session,
                 &adoption_data_dir,
-                &adoption_supervisor.get_all_tasks(),
+                &supervisor.get_all_tasks(),
             );
             if let Some(goal_id) = default_agent_orchestrator().bound_goal_id(
                 &SessionKey(adoption_master_session.clone()),
@@ -1786,7 +1803,7 @@ pub(crate) fn install_peer_restore_observers_resolving_at_callback(
                     &adoption_data_dir,
                     &adoption_profile,
                     &goal_id,
-                    &reconcile_supervisor.get_all_tasks(),
+                    &supervisor.get_all_tasks(),
                 );
             }
         })),
@@ -25578,6 +25595,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
 
         let (_, agent) = upsert_background_task_agent(&task, None)
@@ -25652,6 +25670,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
 
         let (mirrored_session, agent) = upsert_background_task_agent(&task, None)
@@ -26514,6 +26533,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
 
         // Orchestrator A: the task mirrors (ChildCompleted + scatter persist)
@@ -28234,6 +28254,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         }
     }
 
@@ -29048,6 +29069,7 @@ mod tests {
                 runtime_policy_stamp: None,
                 projection_metadata: None,
                 workspace_root: None,
+                relaunched_from: None,
             };
             octos_agent::TerminalEvent {
                 task: task.clone(),
@@ -30656,6 +30678,9 @@ mod tests {
     /// installer, then `enable_persistence` — the restore observer must
     /// adopt the parked peer row whose `result.md` is on the blackboard.
     #[test]
+    // persist_peer_task_id_binding does a durable write, which fails closed
+    // off Unix (Windows refuses File::open on a directory for the dir sync).
+    #[cfg(unix)]
     fn ws_restore_composed_observer_adopts_parked_peer() {
         let dir = tempfile::TempDir::new().unwrap();
         let profile = "tenant-ws-restore";
@@ -30759,6 +30784,9 @@ mod tests {
     /// staged dir's `goal` file), reconcile sees the POST-adoption table, and
     /// the ledger row flips to `complete` instead of idling `running`.
     #[test]
+    // persist_peer_task_id_binding does a durable write, which fails closed
+    // off Unix (Windows refuses File::open on a directory for the dir sync).
+    #[cfg(unix)]
     fn parked_peer_with_result_and_goal_row_settles() {
         let dir = tempfile::TempDir::new().unwrap();
         let profile = "tenant-peer-goal";
@@ -30828,7 +30856,7 @@ mod tests {
         // append is the durable part. Wired with the REAL production gateway
         // installer so its restore is delivered NOW (adoption finds no
         // Parked row yet, no-op) — no stale undelivered flag for boot 3.
-        let sweep_boot = octos_agent::TaskSupervisor::new();
+        let sweep_boot = Arc::new(octos_agent::TaskSupervisor::new());
         install_peer_restore_observers_resolving_at_callback(
             &sweep_boot,
             &wire,
@@ -30842,7 +30870,7 @@ mod tests {
         drop(sweep_boot);
 
         // ── boot 3 (gateway restore shape, post-park) ─────────────────────
-        let supervisor = octos_agent::TaskSupervisor::new();
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
         install_peer_restore_observers_resolving_at_callback(
             &supervisor,
             &wire,
@@ -30895,6 +30923,65 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(task_id);
+    }
+
+    /// #2353 — the composed restore observer must NOT pin the supervisor's
+    /// shared inner state: the adoption consumer needs the supervisor only at
+    /// fire time, so once every external owner drops, the `on_restore` slot
+    /// (and with it the task map, cancel tokens, channel senders) must be
+    /// reclaimed rather than kept alive by a captured strong clone cycling
+    /// back into the slot.
+    #[test]
+    fn restore_observer_installation_does_not_pin_supervisor_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wire = SessionKey::with_profile("tenant-restore-cycle", "api", "restore-cycle");
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        let alive = supervisor.on_restore_slot_alive_probe_for_test();
+        install_peer_restore_observers_resolving_at_callback(
+            &supervisor,
+            &wire,
+            "tenant-restore-cycle",
+            dir.path(),
+        );
+        drop(supervisor);
+        assert!(
+            !alive(),
+            "the restore observer must not keep the supervisor's inner state \
+             alive after its last external owner dropped",
+        );
+    }
+
+    /// #2353 — a child supervisor that INHERITED the composed restore observer
+    /// (`inherit_registration_observers`, the `snapshot_excluding` path) and
+    /// restores after the parent's last owner dropped must cleanly no-op the
+    /// adoption half (its `Weak` upgrade fails) instead of running it against
+    /// a pinned parent — and the inherited copy itself must not re-pin the
+    /// parent's state either.
+    #[test]
+    fn inherited_restore_observer_no_ops_after_parent_supervisor_dropped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wire = SessionKey::with_profile("tenant-restore-cycle", "api", "restore-cycle-child");
+        let parent = Arc::new(octos_agent::TaskSupervisor::new());
+        let parent_alive = parent.on_restore_slot_alive_probe_for_test();
+        install_peer_restore_observers_resolving_at_callback(
+            &parent,
+            &wire,
+            "tenant-restore-cycle",
+            dir.path(),
+        );
+        let child = octos_agent::TaskSupervisor::new();
+        child.inherit_registration_observers(&parent);
+        drop(parent);
+        assert!(
+            !parent_alive(),
+            "the inherited observer copy must not pin the parent's inner state",
+        );
+        // The inherited callback fires on the child's restore; the Weak
+        // upgrade fails and the adoption half no-ops. This must complete
+        // cleanly (no panic, no error).
+        child
+            .enable_persistence(dir.path().join("tasks.jsonl"))
+            .expect("child restore completes after the parent is gone");
     }
 
     /// #2056 case 1 — a terminal supervisor row whose ledger write never
@@ -31846,6 +31933,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
         let signal = octos_agent::SpawnOnlyFailureSignal {
             task_id: task.id.clone(),
@@ -31945,6 +32033,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
         let signal = octos_agent::SpawnOnlyFailureSignal {
             task_id: task.id.clone(),
@@ -32060,6 +32149,7 @@ mod tests {
             runtime_policy_stamp: None,
             projection_metadata: None,
             workspace_root: None,
+            relaunched_from: None,
         };
 
         // Reconcile under the profile the turn actually runs under ("coding"),
@@ -47088,28 +47178,45 @@ mod tests {
                 .expect("epoch segment")
                 .to_owned()
         };
-        // Turn 1: the restored epoch-0 scatter record re-enqueues (it
+        // Turns 1-2: the restored epoch-0 scatter record re-enqueues (it
         // persisted `Queued`; A never tombstoned it — only its MARKS were
-        // seeded) and delivers as a SUPERSEDED-epoch control row. This is
-        // the already-accepted SF1/Nit2 behavior (`restart_reenqueues_in_
-        // deterministic_epoch_order` drains persisted epochs 0/1/2; the Nit2
-        // dual-sink test allows one superseded epoch-0 control row).
+        // seeded) and delivers as a SUPERSEDED-epoch control row (#2309)
+        // beside agent-3's ChildCompleted (persisted Queued, never delivered
+        // pre-crash). Their relative order is stamp-resolution dependent: A
+        // persisted them microseconds apart, and when both `queued_at_ms`
+        // stamps land in the SAME millisecond the SF1 restart sort's final
+        // `continuation_id` tiebreak deterministically orders `child/…`
+        // before `scatter_join/…` ('c' < 's' — pinned by
+        // `restart_reenqueue_orders_equal_queued_at_ms_by_continuation_id`),
+        // so either delivery order satisfies the restored-queue contract.
         let turn0 = &turns[0];
         assert_eq!(turn0.len(), 1);
-        assert_eq!(
-            turn0[0].reason,
-            MasterContinuationReason::ScatterJoinComplete
-        );
-        assert_eq!(
-            epoch_of(&turn0[0]),
-            0,
-            "the superseded epoch-0 control row drains first (SF1 epoch order)"
-        );
-        // Turn 2: agent-3's ChildCompleted (persisted Queued, never
-        // delivered pre-crash) delivers.
         let turn1 = &turns[1];
         assert_eq!(turn1.len(), 1);
-        assert_eq!(turn1[0].reason, MasterContinuationReason::ChildCompleted);
+        assert!(
+            matches!(
+                (&turn0[0].reason, &turn1[0].reason),
+                (
+                    MasterContinuationReason::ScatterJoinComplete,
+                    MasterContinuationReason::ChildCompleted,
+                ) | (
+                    MasterContinuationReason::ChildCompleted,
+                    MasterContinuationReason::ScatterJoinComplete,
+                )
+            ),
+            "the two pre-crash pending rows deliver in either order, got {:?} then {:?}",
+            turn0[0].reason,
+            turn1[0].reason,
+        );
+        let epoch0_row = [turn0[0].clone(), turn1[0].clone()]
+            .into_iter()
+            .find(|item| item.reason == MasterContinuationReason::ScatterJoinComplete)
+            .expect("exactly one ScatterJoinComplete among the first two turns");
+        assert_eq!(
+            epoch_of(&epoch0_row),
+            0,
+            "the superseded epoch-0 control row is one of the first two turns (SF1 epoch order)"
+        );
         // Turn 3: THE FIX — the reconcile pass re-emitted the lost epoch-1
         // join (its persist failed pre-crash, so nothing for epoch 1 was in
         // the store; only the `GroupEpochBumped` marker lifting the restored
@@ -47140,6 +47247,98 @@ mod tests {
             3,
             "exactly three single-item turns; further turns {:?}",
             &turns[3.min(turns.len())..],
+        );
+    }
+
+    /// #2309 — SF1 restart-order tiebreak pin. Two still-`Queued` records
+    /// whose durable `queued_at_ms` stamps are IDENTICAL (a fast host
+    /// persists the epoch-0 join and the next child terminal within one
+    /// millisecond; CI observed this flipping the turn order in
+    /// `multi_epoch_scatter_persist_failure_then_restart_reemits_latest_join`)
+    /// order by the restart sort's final `continuation_id` tiebreak, which
+    /// deterministically puts `child/…` before `scatter_join/…` ('c' < 's').
+    /// Two fresh orchestrators over the same store must agree on that order
+    /// (the SF1 determinism contract).
+    #[test]
+    fn restart_reenqueue_orders_equal_queued_at_ms_by_continuation_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session = "tenant-tie:api:tie";
+        let group = format!("agent-group:tenant-tie:{session}:master");
+        let scatter_id = format!(
+            "scatter_join/{group}/{session}/tenant-tie/{}/0",
+            scatter_cwd_hash(&None)
+        );
+        let child_id = format!("child/{group}/{session}/agent-3");
+        let record = |continuation_id: &str, reason: &str, child_id: Option<&str>| {
+            let mut metadata = SupervisorMetadata::new();
+            metadata.insert("session_id".into(), json!(session));
+            metadata.insert("profile_id".into(), json!("tenant-tie"));
+            metadata.insert("reason".into(), json!(reason));
+            metadata.insert("dedupe_key".into(), json!(continuation_id));
+            metadata.insert("priority".into(), json!(20));
+            PendingContinuationRecord {
+                group_id: group.clone(),
+                continuation_id: continuation_id.to_owned(),
+                child_id: child_id.map(str::to_owned),
+                prompt: None,
+                status: ContinuationStatus::Queued,
+                queued_at_ms: 4242,
+                started_at_ms: None,
+                completed_at_ms: None,
+                result: None,
+                attempt: 1,
+                metadata,
+            }
+        };
+        let store = SupervisorStore::new(dir.path());
+        store
+            .record_continuation_queued(record(&scatter_id, "scatter_join_complete", None))
+            .unwrap();
+        store
+            .record_continuation_queued(record(&child_id, "child_completed", Some("agent-3")))
+            .unwrap();
+        drop(store);
+
+        let session_key = SessionKey::with_profile("tenant-tie", "api", "tie");
+        let drain_order = |runtime: &InProcessAgentOrchestrator| {
+            let mut order = Vec::new();
+            for _ in 0..4 {
+                let drained = runtime.drain_ready_continuations_for_session(
+                    &session_key,
+                    "tenant-tie",
+                    MasterContinuationRuntimeState::idle(),
+                    1,
+                );
+                let Some(item) = drained.first() else {
+                    break;
+                };
+                order.push(item.reason.clone());
+            }
+            order
+        };
+
+        let first = InProcessAgentOrchestrator::default();
+        first.configure_supervisor_store(dir.path()).expect("store");
+        let first_order = drain_order(&first);
+        assert_eq!(
+            first_order,
+            vec![
+                MasterContinuationReason::ChildCompleted,
+                MasterContinuationReason::ScatterJoinComplete,
+            ],
+            "equal queued_at_ms falls through to the continuation_id tiebreak, \
+             which orders `child/…` before `scatter_join/…`"
+        );
+        drop(first);
+
+        let second = InProcessAgentOrchestrator::default();
+        second
+            .configure_supervisor_store(dir.path())
+            .expect("store");
+        assert_eq!(
+            drain_order(&second),
+            first_order,
+            "two fresh orchestrators over the same store re-enqueue identically (SF1 determinism)"
         );
     }
 

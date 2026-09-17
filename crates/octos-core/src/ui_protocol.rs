@@ -160,20 +160,10 @@ pub const UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1: &str = "event.spawn_complete.v1
 /// produced PPTX bytes but 0/8 surfaced a clickable button on the SPA).
 pub const UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1: &str = "event.file_attached.v1";
 
-/// Feature flag for UPCR-2026-014 M9-γ canonical projection envelope.
-///
-/// Capability-gated — servers advertise it only when they emit the
-/// canonical [`Envelope`] shape (see § 14 of the spec). Legacy
-/// `message/delta`, `tool/*`, and `turn/completed`
-/// notifications continue to flow on connections that do not negotiate
-/// this feature, until M9-γ-3 deletes them.
-pub const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1: &str = "projection.envelope.v1";
-
 /// Feature flag for the Stage 1 canonical projection envelope contract.
 ///
 /// This remains the request token for projecting historical source records
-/// into v2 alongside (not a replacement for)
-/// [`UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1`]. Stage 5 writes canonical
+/// into v2 form on replay. Stage 5 writes canonical
 /// [`EnvelopeV2`] rows directly, and those rows are delivered regardless of
 /// feature negotiation. V2 retains the flattened `projection/envelope`
 /// method shape while adding a durable ledger cursor, an explicit turn id,
@@ -317,7 +307,6 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
     UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
-    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
@@ -375,6 +364,9 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::CONTENT_BULK_DELETE
         | methods::MEMORY_OVERVIEW
         | methods::MEMORY_ENTITY
+        | methods::MEMORY_SEARCH
+        | methods::MEMORY_LOAD
+        | methods::MEMORY_INGEST
         | methods::CRON_LIST
         | methods::CRON_TOGGLE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
         methods::AGENT_LIST
@@ -1252,6 +1244,18 @@ pub mod methods {
     pub const MEMORY_OVERVIEW: &str = "memory/overview";
     /// Replaces `GET /api/my/memory/entities/{name}` — full entity page.
     pub const MEMORY_ENTITY: &str = "memory/entity";
+    /// Recall/Knowledge index search (BM25 + optional vectors) — returns
+    /// ranked hits `{id, kind, source, title, abstract, score,
+    /// timestamp, trust}`; bodies are fetched with [`MEMORY_LOAD`].
+    /// See `docs/adr/personal-memory-tiers.md`.
+    pub const MEMORY_SEARCH: &str = "memory/search";
+    /// Load one Recall/Knowledge record by id (second stage after
+    /// [`MEMORY_SEARCH`]); for `bank:` knowledge records the page text
+    /// rides along. Counts a visit (heat).
+    pub const MEMORY_LOAD: &str = "memory/load";
+    /// Ingest app records (documents / episodes) into the Recall index.
+    /// The only memory WRITE method; knowledge pages are refused here.
+    pub const MEMORY_INGEST: &str = "memory/ingest";
     /// Replaces `GET /api/my/cron` — cron panel job listing.
     pub const CRON_LIST: &str = "cron/list";
     /// Replaces `PUT /api/my/cron/{job_id}/enabled` — cron job toggle.
@@ -1415,6 +1419,9 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::CONTENT_BULK_DELETE,
     methods::MEMORY_OVERVIEW,
     methods::MEMORY_ENTITY,
+    methods::MEMORY_SEARCH,
+    methods::MEMORY_LOAD,
+    methods::MEMORY_INGEST,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -1542,6 +1549,9 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::CONTENT_BULK_DELETE,
     methods::MEMORY_OVERVIEW,
     methods::MEMORY_ENTITY,
+    methods::MEMORY_SEARCH,
+    methods::MEMORY_LOAD,
+    methods::MEMORY_INGEST,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -2971,6 +2981,16 @@ pub struct SessionHydrateResult {
     /// live delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replayed_tool_envelopes: Option<Vec<EnvelopeV2>>,
+    /// Bounded retained canonical v2 records through `cursor`. Complete
+    /// threads retain their sequence; compacted threads retain terminals and
+    /// reconstruct visible content from `messages` and tool replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed_projection_envelopes: Option<Vec<EnvelopeV2>>,
+    /// Highest canonical per-thread sequence included in the atomic ledger
+    /// snapshot. A transcript reconstruction resumes live delivery after this
+    /// checkpoint even when the retained event prefix was evicted/compacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_thread_sequences: Option<BTreeMap<String, u64>>,
 }
 
 /// Params for `session/rollback` — conversation-only rewind. Drops the last
@@ -3546,6 +3566,99 @@ pub struct MemoryEntityResult {
     pub content_total_bytes: usize,
 }
 
+/// Default `limit` for `memory/search` when the caller omits it.
+pub const MEMORY_SEARCH_DEFAULT_LIMIT: usize = 10;
+/// Hard ceiling for `memory/search.limit`; larger values are clamped.
+pub const MEMORY_SEARCH_MAX_LIMIT: usize = 50;
+/// Hard ceiling on `memory/ingest.records.len()` per call.
+pub const MEMORY_INGEST_MAX_RECORDS: usize = 500;
+
+/// Params for `memory/search` — first stage of the two-stage Recall /
+/// Knowledge retrieval (`docs/adr/personal-memory-tiers.md`). `query`
+/// is free text; `kinds` narrows to `"episode"` / `"document"` /
+/// `"knowledge"` (empty = all); `sources` narrows to record sources
+/// (e.g. `"mail"`, empty = all); `since` / `until` are RFC 3339
+/// timestamps or `YYYY-MM-DD` dates; `limit` defaults to
+/// [`MEMORY_SEARCH_DEFAULT_LIMIT`] and is clamped to
+/// [`MEMORY_SEARCH_MAX_LIMIT`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySearchParams {
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// Result for `memory/search`. Each hit is the JSON of
+/// `octos_memory::Hit` — `{ id, kind, source, title, abstract, score,
+/// timestamp, trust }` — ranked best first. App-sourced hits carry
+/// `trust: "untrusted"`; callers must treat their text as data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemorySearchResult {
+    pub hits: Vec<Value>,
+}
+
+/// Params for `memory/load` — second stage: fetch one record by the
+/// `id` a `memory/search` hit returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryLoadParams {
+    pub id: String,
+}
+
+/// Result for `memory/load`. `record` is the JSON of
+/// `octos_memory::Record`. For Knowledge records (`id` starts with
+/// `bank:`) `page` carries the bank page markdown, capped at the same
+/// RPC-layer byte budget as `memory/entity` (`page_truncated` reports
+/// the cap; capped text is a clean UTF-8 prefix). For Recall records
+/// `page` is `null` — the app owning the record is the record of
+/// truth for its body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryLoadResult {
+    pub record: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<String>,
+    #[serde(default)]
+    pub page_truncated: bool,
+}
+
+/// Params for `memory/ingest` — write app records into the Recall
+/// index. Each element of `records` is an `octos_memory::Record` JSON
+/// (`id`, `kind`, `source`, `timestamp`, `title`, `abstract` required;
+/// `parent`, `body`, `trust`, `fingerprint` optional). `vectors`, when
+/// supplied, is parallel to `records` (one optional embedding each);
+/// otherwise the server embeds `Record::index_text()` itself when
+/// `embed` (default `true`) and an embedder is configured. At most
+/// [`MEMORY_INGEST_MAX_RECORDS`] records per call. Knowledge (`bank:`)
+/// records are refused — they are written through the memory bank.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemoryIngestParams {
+    pub records: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<Vec<Option<Vec<f32>>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed: Option<bool>,
+}
+
+/// Result for `memory/ingest` — the `octos_memory::UpsertReport`
+/// counts: how many records were new, changed, or already identical
+/// (by fingerprint), how many vectors were stored, and how many of
+/// those the server embedded itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryIngestResult {
+    pub inserted: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    pub vectors_stored: usize,
+    pub embedded: usize,
+}
+
 /// Params for `cron/list`. Empty today; the struct exists so `{}` /
 /// `null` params decode uniformly (mirrors [`SystemStatusGetParams`];
 /// the wire `params` MEMBER must still be present).
@@ -3783,247 +3896,6 @@ pub const ENVELOPE_TOOL_ARGUMENTS_PREVIEW_MAX: usize = 700;
 /// transcript/tool message).
 pub const ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX: usize = 2048;
 
-/// Sealed tagged union of payloads carried by the M9-γ projection
-/// envelope. Each variant carries everything the projection needs;
-/// the projection function is `(committed_log) → ChatViewModel` and
-/// MUST NOT consult any other source of truth.
-///
-/// Wire form: JSON with `"type"` discriminator and content under `"data"`.
-/// Variant names are snake_case to match the spec § 14 / TS shape.
-///
-/// **Turn shape**: every chat turn begins with exactly one
-/// [`Payload::UserMessage`] envelope (server-mirrored from the client's
-/// send), followed by zero or more `assistant_delta` / `tool_*` /
-/// `file_attached` / `assistant_persisted` envelopes, terminated by
-/// exactly one [`Payload::TurnCompleted`]. A refresh-only projection
-/// reconstructs the `UserView` for the chat exclusively from
-/// `user_message` envelopes — `assistant_delta` and `assistant_persisted`
-/// alone are insufficient.
-///
-/// **Streaming reconciliation rule** (locked by spec § 14.2):
-/// `assistant_delta.text` fragments APPEND to the live bubble in
-/// strict `seq` order (concatenate). When an `assistant_persisted`
-/// arrives for the same thread, its `text` field REPLACES the
-/// accumulated streamed text — the persisted form is canonical and
-/// avoids double-rendering the final body.
-///
-/// **Hard barrier**: per the M9-γ ADR and spec § 14.6,
-/// [`Payload::TurnCompleted`] is the terminal payload for a `thread_id`.
-/// Any envelope arriving on the same `thread_id` AFTER `turn_completed`
-/// is DROPPED by the projection and counted in the
-/// `octos_projection_post_completion_drop_total` metric. Threads are
-/// NOT reused — a new turn must use a NEW `thread_id`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum Payload {
-    /// User-message turn root — server-mirrored from the client's send.
-    /// Every chat turn begins with exactly one `user_message` envelope,
-    /// and the projection's `UserView` is reconstructed from these
-    /// envelopes alone (a refresh-only projection cannot recover user
-    /// bubbles from `assistant_delta` / `assistant_persisted`).
-    ///
-    /// The carrying [`Envelope`] populates `client_message_id` here —
-    /// and ONLY here — so the optimistic `<GhostBubble>` overlay can
-    /// match its server reflection and unmount.
-    UserMessage {
-        text: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        files: Vec<FileRef>,
-    },
-    /// One streamed assistant text fragment. Multiple `assistant_delta`
-    /// envelopes for the same `thread_id` accumulate (concatenate by
-    /// `seq` order) into the live assistant bubble. An
-    /// `assistant_persisted` for the same thread REPLACES the
-    /// accumulated text.
-    AssistantDelta { text: String },
-    /// One streamed assistant reasoning fragment. Clients render this on a
-    /// separate reasoning surface from assistant answer text.
-    ReasoningDelta { text: String },
-    /// Final assistant text persisted to the ledger after streaming
-    /// completes. Carries the durable [`MessageMeta`] so the projection
-    /// can finalize the bubble's identity and surface attachments. Its
-    /// `text` field REPLACES the concatenated streamed deltas for the
-    /// same thread (canonical final form; avoids double-rendering).
-    AssistantPersisted { text: String, meta: MessageMeta },
-    /// Tool invocation begun. The projection opens a tool-call card
-    /// keyed on `tool_call_id`.
-    ToolStart {
-        tool_call_id: String,
-        name: String,
-        /// Compact JSON of the call arguments, UTF-8-truncated to
-        /// [`ENVELOPE_TOOL_ARGUMENTS_PREVIEW_MAX`] — display fidelity for
-        /// tool cards (`shell(cd … && cargo test)`), NOT a replayable
-        /// argument record. `None` on argument-less calls and on
-        /// envelopes persisted before this field existed.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        arguments_preview: Option<String>,
-    },
-    /// Tool emitted a progress message. Idempotent per `(tool_call_id,
-    /// seq)`; the projection appends in `seq` order.
-    ToolProgress {
-        tool_call_id: String,
-        message: String,
-    },
-    /// Tool invocation finished. `error` is set iff `status == "error"`.
-    /// `reason` carries optional human-readable detail for `skipped`
-    /// (deadline-skip, pre-condition unmet) and `aborted`
-    /// (user `turn/interrupt`, system cancellation) outcomes.
-    ToolEnd {
-        tool_call_id: String,
-        status: EnvelopeToolEndStatus,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-        /// First lines of the tool result, UTF-8-truncated to
-        /// [`ENVELOPE_TOOL_OUTPUT_PREVIEW_MAX`] — the `⎿ …` result excerpt
-        /// under the card. `None` for output-less tools and on envelopes
-        /// persisted before this field existed.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        output_preview: Option<String>,
-        /// Wall-clock duration of the call, when the emitter tracked it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        duration_ms: Option<u64>,
-    },
-    /// File attached to the current thread (e.g. `.md` report from
-    /// `deep_search` or `.mp3` from `fm_tts`). The projection adds the
-    /// attachment to the most-recent assistant bubble in `thread_id`.
-    FileAttached {
-        path: String,
-        mime: String,
-        size_bytes: u64,
-    },
-    /// Hard barrier — terminal payload for a turn within `thread_id`.
-    /// Per the M9-γ ADR, any envelope arriving with the same
-    /// `thread_id` AFTER this one is DROPPED by the projection (and
-    /// counted in `octos_projection_post_completion_drop_total`).
-    /// Threads are not reused — a new turn must use a new `thread_id`.
-    TurnCompleted { token_usage: EnvelopeTokenUsage },
-}
-
-/// Canonical M9-γ projection envelope.
-///
-/// Per UPCR-2026-014 and the M9-γ ADR, this is the single shape the
-/// web client's deterministic projection consumes. The committed
-/// envelope log is `Vec<Envelope>` indexed by `(thread_id, seq)`; the
-/// projection is a pure function from that log to `ChatViewModel`.
-///
-/// Identity collapses to `seq` — the only key the projection cares
-/// about. `client_message_id` is populated ONLY on
-/// [`Payload::UserMessage`] envelopes so the optimistic
-/// `<GhostBubble>` overlay can match its server reflection and unmount;
-/// the projection itself NEVER consults it. All other variants leave
-/// `client_message_id` at `None` (omitted on the wire).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Envelope {
-    /// Multi-turn cluster identity — the chat thread this envelope
-    /// projects into. All envelopes for one logical conversation share
-    /// a `thread_id`.
-    pub thread_id: String,
-    /// Server-assigned strict total order WITHIN this `thread_id`.
-    /// Strictly monotonic; gaps are an error and trigger
-    /// rehydration. Identity for the projection.
-    pub seq: u64,
-    /// Populated ONLY on [`Payload::UserMessage`] envelopes (the
-    /// optimistic `<GhostBubble>` overlay matches its server reflection
-    /// here). Absent on every other variant (assistant deltas /
-    /// persisted, tool events, file attached, turn_completed). The
-    /// projection MUST NOT consult this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_message_id: Option<String>,
-    /// Tagged-union payload — see [`Payload`].
-    pub payload: Payload,
-}
-
-/// Ledger / wire wrapper around [`Envelope`] for the
-/// `projection/envelope` notification (UPCR-2026-014 M9-γ).
-///
-/// The in-memory ledger needs the `SessionKey` to route the event to
-/// the right per-session ring and broadcast channel, and it needs the
-/// optional `topic` so the topic-scope live filter
-/// (`ledger_event_matches_topic_scope`) keeps envelopes flowing to the
-/// right subscriber pane. This wrapper carries those routing fields
-/// **outside** of the `envelope` body so the durable ledger can persist
-/// them and recovery can rebuild the routing context after restart.
-///
-/// **Wire shape (spec § 14.1, feat(envelope-wire-routing)):** the
-/// JSON-RPC `params` field is the bare `Envelope` fields FLATTENED with
-/// the routing keys — `{ thread_id, seq, client_message_id?, payload,
-/// session_id, topic? }`. `session_id` is the bare base key so a
-/// multi-session client can route the envelope to the correct session;
-/// `topic` is omitted when `None`. This replaces the original
-/// bare-`Envelope`-only wire (no routing keys), which left a
-/// multi-session consumer with an unroutable empty `session_id`. The
-/// flatten keeps the bare keys at the top level, so a tolerant client
-/// that reads `thread_id`/`seq`/`payload` top-level and ignores unknown
-/// keys (the octos-web bridge) decodes it unchanged; the decoder also
-/// accepts an OLD frame lacking `session_id` (defaults to empty / None).
-/// The wire DTO is [`EnvelopeWire`]; serialization happens only at the
-/// JSON-RPC boundary in [`UiNotification::into_rpc_notification`] /
-/// [`UiNotification::from_method_and_params`].
-///
-/// **Disk shape (codex #1336 round-2 BLOCKER 4 — UNCHANGED):** the
-/// global `Serialize` / `Deserialize` derive on this struct includes ALL
-/// fields (envelope + session_id + topic) as a NESTED `{ session_id,
-/// topic, envelope }` object so the DURABLE LEDGER round-trips routing
-/// state across daemon restart. BLOCKER 4's invariant — disk records
-/// must not lose routing, else topic-scoped replay after restart
-/// mis-routes — holds: the wire DTO above does not touch this derive,
-/// so the disk path is byte-for-byte identical to before this change.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnvelopeNotification {
-    /// Session this envelope belongs to. Used for ledger routing and
-    /// broadcast fan-out. Stripped from the wire (spec § 14.1) at the
-    /// `into_rpc_notification` boundary; preserved on disk so recovery
-    /// can rebuild routing.
-    pub session_id: SessionKey,
-    /// Optional topic for topic-scoped live forwarders (#1329 P0-A class
-    /// fix). Captured at the emit site BEFORE any `base_key()` strip so
-    /// the topic-scope filter routes correctly even when `session_id`
-    /// is the bare base key. Stripped from the wire at the
-    /// `into_rpc_notification` boundary; preserved on disk so recovery
-    /// can re-route topic-scoped envelopes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub topic: Option<String>,
-    /// The canonical wire envelope — serializes verbatim per spec § 14.1.
-    pub envelope: Envelope,
-}
-
-/// Wire DTO for the `projection/envelope` JSON-RPC notification
-/// (feat(envelope-wire-routing)).
-///
-/// This is the shape on the WIRE — distinct from the on-disk derive of
-/// [`EnvelopeNotification`]. The bare [`Envelope`] fields are
-/// `#[serde(flatten)]`-ed to the top level (`thread_id`, `seq`,
-/// `client_message_id?`, `payload`) so an older/tolerant client decodes
-/// them unchanged, and the routing keys `session_id` + `topic` sit
-/// alongside them. Used ONLY at the JSON-RPC boundary in
-/// [`UiNotification::into_rpc_notification`] /
-/// [`UiNotification::from_method_and_params`]; the durable ledger never
-/// serializes through this type.
-///
-/// Backward-compatible on decode: `session_id` defaults to the empty
-/// [`SessionKey`] and `topic` to `None` when an OLD bare-envelope frame
-/// (no routing keys) is received.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct EnvelopeWire {
-    /// Bare base session key for client-side routing. Normalized to the
-    /// base key at the `into_rpc_notification` boundary (any `#topic`
-    /// suffix folded in by `turn/start` is stripped here and surfaced on
-    /// `topic` below). Defaults to the empty key for legacy frames that
-    /// predate this wire field.
-    #[serde(default = "empty_session_key")]
-    session_id: SessionKey,
-    /// Optional topic for topic-scoped routing. Omitted when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    topic: Option<String>,
-    /// Bare envelope fields, flattened to the top level so the wire is
-    /// `{ thread_id, seq, client_message_id?, payload, session_id,
-    /// topic? }`.
-    #[serde(flatten)]
-    envelope: Envelope,
-}
-
 // ----- projection.envelope.v2 canonical contract -----
 
 /// Closed outcome set for [`PayloadV2::TurnTerminal`].
@@ -4248,6 +4120,9 @@ pub enum UiCommand {
     ContentBulkDelete(ContentBulkDeleteParams),
     MemoryOverview(MemoryOverviewParams),
     MemoryEntity(MemoryEntityParams),
+    MemorySearch(MemorySearchParams),
+    MemoryLoad(MemoryLoadParams),
+    MemoryIngest(MemoryIngestParams),
     CronList(CronListParams),
     CronToggle(CronToggleParams),
     // ---- Wave4-A: adaptive router controls ----
@@ -4303,6 +4178,9 @@ impl UiCommand {
             Self::ContentBulkDelete(_) => methods::CONTENT_BULK_DELETE,
             Self::MemoryOverview(_) => methods::MEMORY_OVERVIEW,
             Self::MemoryEntity(_) => methods::MEMORY_ENTITY,
+            Self::MemorySearch(_) => methods::MEMORY_SEARCH,
+            Self::MemoryLoad(_) => methods::MEMORY_LOAD,
+            Self::MemoryIngest(_) => methods::MEMORY_INGEST,
             Self::CronList(_) => methods::CRON_LIST,
             Self::CronToggle(_) => methods::CRON_TOGGLE,
             Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
@@ -4359,6 +4237,9 @@ impl UiCommand {
             Self::ContentBulkDelete(params) => serde_json::to_value(params),
             Self::MemoryOverview(params) => serde_json::to_value(params),
             Self::MemoryEntity(params) => serde_json::to_value(params),
+            Self::MemorySearch(params) => serde_json::to_value(params),
+            Self::MemoryLoad(params) => serde_json::to_value(params),
+            Self::MemoryIngest(params) => serde_json::to_value(params),
             Self::CronList(params) => serde_json::to_value(params),
             Self::CronToggle(params) => serde_json::to_value(params),
             Self::RouterSetMode(params) => serde_json::to_value(params),
@@ -4458,6 +4339,9 @@ impl UiCommand {
                 method, params,
             )?)),
             methods::MEMORY_ENTITY => Ok(Self::MemoryEntity(decode_params(method, params)?)),
+            methods::MEMORY_SEARCH => Ok(Self::MemorySearch(decode_params(method, params)?)),
+            methods::MEMORY_LOAD => Ok(Self::MemoryLoad(decode_params(method, params)?)),
+            methods::MEMORY_INGEST => Ok(Self::MemoryIngest(decode_params(method, params)?)),
             methods::CRON_LIST => Ok(Self::CronList(decode_optional_params(method, params)?)),
             methods::CRON_TOGGLE => Ok(Self::CronToggle(decode_params(method, params)?)),
             methods::ROUTER_SET_MODE => Ok(Self::RouterSetMode(decode_params(method, params)?)),
@@ -5819,6 +5703,24 @@ pub struct TaskUpdatedEvent {
     /// `BackgroundTask::runtime_policy_stamp`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_policy_stamp: Option<Value>,
+    /// #1595: server clock timestamp of task registration (ISO-8601,
+    /// same chrono RFC 3339 wire form as the `task/list` projection
+    /// field of the same name). Clients ranking rows that share one
+    /// `tool_call_id` (pipeline families, relaunch chains) must order
+    /// by this server timestamp — rows hydrated live otherwise only
+    /// have client receipt-time, which a reconnect replay can deliver
+    /// out of order. Mirrors `BackgroundTask::started_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// #1595: first-class relaunch lineage — the predecessor task id
+    /// when this task was created by `TaskSupervisor::relaunch`.
+    /// Surfacing it as a dedicated field (instead of the JSON stamped
+    /// into `runtime_detail` on the spawn transition, which the next
+    /// `mark_runtime_state` overwrite drops) lets clients resolve the
+    /// chain explicitly on every frame. Mirrors
+    /// `BackgroundTask::relaunched_from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaunched_from: Option<String>,
     /// C1 step 4: the turn that originated this task. Lets the client
     /// reconcile its per-turn "N running" task count when a sub-agent
     /// fails/recovers/errors/is-orphaned — without it the count stayed
@@ -6759,18 +6661,11 @@ pub enum UiNotification {
     /// #2019: a background event that woke the model, surfaced to the HUMAN.
     /// See [`BackgroundActivityEvent`].
     BackgroundActivity(BackgroundActivityEvent),
-    /// UPCR-2026-014 (M9-γ) canonical projection envelope (`projection/envelope`).
-    /// Spec § 14. Capability-gated on `projection.envelope.v1`; the
-    /// per-connection live filter keeps legacy and envelope deliveries
-    /// mutually exclusive (legacy clients never see this variant,
-    /// negotiated clients see ONLY this variant for the events it
-    /// supersedes — `message/delta`, `tool/*`,
-    /// `turn/completed`, `file/attached`).
-    Envelope(EnvelopeNotification),
-    /// Stage-1 canonical projection envelope. Uses the same flattened
-    /// `projection/envelope` method as v1. New canonical rows are delivered
-    /// unconditionally; `projection.envelope.v2` still requests v2
-    /// projection of historical source records.
+    /// Canonical projection envelope (`projection/envelope`). The sole
+    /// projection lane: every streamed/persisted assistant, reasoning, tool,
+    /// file, terminal, and background-child row is carried here. Delivered to
+    /// every connection; historical source records are projected into this
+    /// shape on replay.
     EnvelopeV2(EnvelopeV2Notification),
 }
 
@@ -6839,7 +6734,6 @@ impl UiNotification {
             Self::PeerStaged(_) => methods::PEER_STAGED,
             Self::PeerClosed(_) => methods::PEER_CLOSED,
             Self::BackgroundActivity(_) => methods::BACKGROUND_ACTIVITY,
-            Self::Envelope(_) => methods::PROJECTION_ENVELOPE,
             Self::EnvelopeV2(_) => methods::PROJECTION_ENVELOPE,
         }
     }
@@ -6897,7 +6791,6 @@ impl UiNotification {
             Self::PeerStaged(event) => &event.session_id,
             Self::PeerClosed(event) => &event.session_id,
             Self::BackgroundActivity(event) => &event.session_id,
-            Self::Envelope(event) => &event.session_id,
             Self::EnvelopeV2(event) => &event.session_id,
         }
     }
@@ -6967,7 +6860,6 @@ impl UiNotification {
             Self::SessionEventBridged(event) => {
                 event.topic.as_deref().or_else(|| event.session_id.topic())
             }
-            Self::Envelope(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
             Self::EnvelopeV2(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
             _ => self.session_id().topic(),
         }
@@ -7003,7 +6895,6 @@ impl UiNotification {
             Self::FileAttached(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::VoiceAudioChunk(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::SessionEventBridged(event) => set_topic_if_absent(&mut event.topic, &topic),
-            Self::Envelope(event) => set_topic_if_absent(&mut event.topic, &topic),
             Self::EnvelopeV2(event) => set_topic_if_absent(&mut event.topic, &topic),
             _ => {}
         }
@@ -7103,17 +6994,9 @@ impl UiNotification {
             // `"base#topic"`), and keep the topic — recovering it from the
             // suffix when the explicit `topic` field is empty so it is
             // never lost.
-            Self::Envelope(params) => serde_json::to_value(&EnvelopeWire {
-                session_id: SessionKey(params.session_id.base_key().to_owned()),
-                topic: params
-                    .topic
-                    .clone()
-                    .or_else(|| params.session_id.topic().map(str::to_owned)),
-                envelope: params.envelope,
-            }),
-            // Stage 1 v2 deliberately reuses the same flattened method
-            // boundary as v1. The capability selects the contract; `turn_id`
-            // makes the two wire DTOs unambiguous on decode.
+            // The canonical projection envelope flattens its routing keys and
+            // bare envelope fields at the top level; `turn_id` is always
+            // present, which the decoder uses to recognize the shape.
             Self::EnvelopeV2(params) => serde_json::to_value(&EnvelopeWireV2 {
                 session_id: SessionKey(params.session_id.base_key().to_owned()),
                 topic: params
@@ -7238,21 +7121,12 @@ impl UiNotification {
             // `session_id`; for a legacy empty key it falls back to its
             // ambient connection context.
             methods::PROJECTION_ENVELOPE => {
-                if params.get("turn_id").is_some() {
-                    let wire: EnvelopeWireV2 = decode_params(method, params)?;
-                    Ok(Self::EnvelopeV2(EnvelopeV2Notification {
-                        session_id: wire.session_id,
-                        topic: wire.topic,
-                        envelope: wire.envelope,
-                    }))
-                } else {
-                    let wire: EnvelopeWire = decode_params(method, params)?;
-                    Ok(Self::Envelope(EnvelopeNotification {
-                        session_id: wire.session_id,
-                        topic: wire.topic,
-                        envelope: wire.envelope,
-                    }))
-                }
+                let wire: EnvelopeWireV2 = decode_params(method, params)?;
+                Ok(Self::EnvelopeV2(EnvelopeV2Notification {
+                    session_id: wire.session_id,
+                    topic: wire.topic,
+                    envelope: wire.envelope,
+                }))
             }
             _ => Err(RpcError::method_not_found(method)),
         }

@@ -463,6 +463,9 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/list`, `cron/toggle`
+- `memory/search`, `memory/load`, `memory/ingest` (Recall/Knowledge index —
+  `docs/adr/personal-memory-tiers.md`; auth-bound like `memory/overview`,
+  refused for session-ingress credentials)
 
 Launch (per-project session UX, gated `session.workspace_cwd.v1`):
 
@@ -500,14 +503,17 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   brief under the profile data dir (`peers/<slug>/brief.md`) and optionally
   creates a fenced git worktree on branch `peer/<slug>`; returns
   `{slug, topic, brief_path, cwd, worktree_branch?, profile_id}`. Pure
-  resource staging — the client then opens the peer session and starts the
+  resource staging; a stored profile is sufficient even before its runtime
+  is bootstrapped. The client then opens the peer session and starts the
   kickoff turn through the ordinary `session/open` + `turn/start`; #1801 v2
   adds `n` (1..=8) for fleet staging — N suffixed slugs from ONE brief, the
   scalar result fields mirror the first peer and `peers: [...]` carries all)
 - `peer/gather` (#1801 v2 blackboard read: per staged peer its brief + the
   latest `result.md` — written server-side on every peer-session turn
   terminal — with per-field truncation flags and `result_updated_unix`;
-  optional `slugs` filter)
+  optional `slugs` filter; reading a stored profile does not bootstrap a
+  runtime. Once bootstrapped, peer staging, results and parent continuation
+  use the same active profile runtime as `session/open` and `turn/start`.)
 - `profile/skills/list`, `profile/skills/registry/search`,
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)
@@ -519,6 +525,28 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `mcp/status/list`, `tool/status/list` (accepted `UPCR-2026-017`)
 - `onboarding/workspace_probe` (gate `onboarding.workspace_probe.v1`,
   local-solo only; #1057)
+- `onboarding/workspace_list`, `onboarding/workspace_create` (gate
+  `onboarding.workspace_browse.v1`, local-solo only;
+  WEB-WORKSPACE-BROWSER-CONTRACT-5000. Server-side folder browsing for the
+  workspace-creation form: `workspace_list` answers
+  `{canonical_path, parent_path, writable, entries[{name, path, writable}],
+  truncated, hidden_skipped}` for a resolved directory — directories only,
+  sorted case-insensitively, dot-directories counted in `hidden_skipped`,
+  at most 500 entries with `truncated` set when more existed, `parent_path`
+  null at the filesystem root or when the parent would be a banned system
+  path; `workspace_create` takes `{parent, name}` and answers
+  `{canonical_path, created}`, with `created: false` for an existing
+  directory of that name — an idempotent success, not an error. Typed
+  `data.kind` errors, same shape as the probe:
+  `workspace_list_invalid_path`, `workspace_list_not_found`,
+  `workspace_list_not_a_directory`, `workspace_list_permission_denied`,
+  `workspace_list_root_escape` (with `banned_root`),
+  `workspace_create_invalid_name`, `workspace_create_parent_not_found`,
+  `workspace_create_parent_not_a_directory`,
+  `workspace_create_permission_denied`, `workspace_create_root_escape`,
+  `workspace_create_exists_not_directory`, and `profile_local_unsupported`
+  on tenant/cloud. A client that does not see the feature keeps the
+  typed-path form and hides every browsing affordance — fail closed.)
 
 Notifications:
 
@@ -1260,6 +1288,12 @@ Clients must use that method list to enable or disable slash commands.
   backend can expose backend-owned context state for AppUI turns. Clients should
   render this state from `session/status/read` and must not infer it from chat
   rows or local transcript heuristics.
+- When `context.semantic_cache.v1` is also negotiated, `context_state` may
+  include `cache_epoch_id`, `last_cache_invalidation_reason`, `semantic_head_id`,
+  and `semantic_head_kind`. These are opaque, display-only diagnostics owned
+  by the backend; clients must not put them into model prompts or use them to
+  choose compaction boundaries. Missing fields do not establish a cache hit
+  or miss. See [UPCR-2026-029](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_029_SEMANTIC_CONTEXT_CACHE_DIAGNOSTICS.md).
 - `session/open`, `session/hydrate`, legacy REST-bridge
   `session/status.get`, and `turn/state/get` also include `context` and
   `context_state` when `context.lifecycle.v1` is available.
@@ -1812,6 +1846,111 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `resource_not_found` with `data.resource_type = "memory_entity"` and
   `data.identifier = <name>` on REST 404.
 
+#### `memory/search`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: nothing — new surface (`docs/adr/personal-memory-tiers.md`,
+  phase 2). Stage one of the two-stage Recall/Knowledge retrieval: ranks
+  the caller's profile index (BM25 fused with vectors when the profile
+  has an embedder; BM25-only otherwise — never refused for lack of one)
+  and returns abstracts only. Bodies come from `memory/load`.
+- Params type: `MemorySearchParams` — `{ query: string, kinds?: string[],
+  sources?: string[], since?: string, until?: string, limit?: number }`.
+  `query` must be non-blank. `kinds` narrows to `"episode"` /
+  `"document"` / `"knowledge"` (empty = all; lenient aliases such as
+  `doc` are accepted). `sources` narrows to record sources (`mail`,
+  `calendar`, …; empty = all). `since` / `until` are RFC 3339 timestamps
+  (any offset, normalised to UTC) or bare `YYYY-MM-DD` dates — a bare
+  `since` is the start of that UTC day, a bare `until` its end (`until`
+  is inclusive). `limit` defaults to `MEMORY_SEARCH_DEFAULT_LIMIT` (10)
+  and is clamped to `1..=MEMORY_SEARCH_MAX_LIMIT` (50).
+- Result type: `MemorySearchResult` — `{ hits: Hit[] }` where each hit is
+  the JSON of `octos_memory::Hit`: `{ id: string, kind: "episode" |
+  "document" | "knowledge", source: string, title: string, abstract:
+  string, score: number, timestamp: RFC3339, trust: "trusted" |
+  "untrusted" }`, best first. App-sourced hits are `untrusted`: clients
+  and prompts must treat their text as data, never as instructions.
+- Errors: `auth_unavailable` (`-32120`) with WS close code
+  `1008 auth_expired` if the connection has no usable identity;
+  `invalid_params` for a blank query, an unknown kind, an unparseable
+  or inverted time bound; `runtime_unavailable` when the resolved
+  profile has no bootstrappable runtime (same message as session open).
+- Identity resolves to a profile exactly as `memory/overview` does
+  (`/api/my/*` host-scope rules); auth-bound — omitted from the stdio
+  capability set (see § stdio policy) and refused for session-ingress
+  credentials.
+
+#### `memory/load`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: nothing — new surface. Stage two: fetch one record by the
+  `id` a `memory/search` hit returned. Counts a visit on the record
+  (MemoryOS-style heat: hot records keep their vector and are nominated
+  for promotion into Knowledge).
+- Params type: `MemoryLoadParams` — `{ id: string }` (non-blank).
+- Result type: `MemoryLoadResult` — `{ record: Record, page?: string,
+  page_truncated: bool }`. `record` is the JSON of `octos_memory::Record`
+  (`id`, `kind`, `source`, `parent?`, `timestamp`, `title`, `abstract`,
+  `body?`, `trust`, `fingerprint?`, `visits`, `last_visit?`, `promoted`,
+  `updated_at`, `schema_version`). For Knowledge records (`id` starting
+  `bank:`) `page` carries the bank page markdown read from
+  `<data_dir>/memory/bank/entities/<slug>.md`, capped at the same
+  384 KiB JSON-ESCAPED budget as `memory/entity`; when capped it is a
+  clean UTF-8 prefix and `page_truncated` is `true`. `page` is absent
+  for Recall records (the owning app is the record of truth for bodies)
+  and for an indexed page whose file has since been removed.
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `invalid_params` for a blank id; `resource_not_found` (`-32170`) with
+  `data.resource_type = "memory_record"` and `data.identifier = <id>`
+  when no record has that id; `runtime_unavailable` as for
+  `memory/search`.
+
+#### `memory/ingest`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: nothing — new surface, and the ONLY memory write on the
+  protocol. Apps (Mail, Calendar, contacts, notes) push derived records
+  into the profile's Recall index; the apps remain the record of truth.
+  Runs on the same authenticated path as `memory/overview` (identity
+  required, `/api/my/*` profile resolution); session-ingress credentials
+  are refused by the scope guard.
+- Params type: `MemoryIngestParams` — `{ records: Record[], vectors?:
+  (number[] | null)[], embed?: bool }`. Each record is an
+  `octos_memory::Record` JSON: required `id`, `kind`, `source`,
+  `timestamp` (RFC 3339), `title`, `abstract`; optional `parent`,
+  `body`, `trust`, `fingerprint` (producer-side change detector —
+  records whose fingerprint and index text are unchanged are skipped
+  and their vectors kept). Server-owned fields (`visits`, `last_visit`,
+  `promoted`, `updated_at`) are ignored on input. Validation
+  (`invalid_params`, message names `records[i]`): 1 ≤ `records.len()`
+  ≤ `MEMORY_INGEST_MAX_RECORDS` (500; over-cap carries
+  `data.max_records` / `data.requested_records`); `vectors`, when
+  present, is parallel to `records`; `kind` parses; ids are non-blank
+  and namespaced by kind — documents `doc:<source>:<key>`, episodes
+  `episode:<key>`; Knowledge (`bank:`) records are refused with
+  "knowledge pages are written through save_memory / the memory bank,
+  not ingest"; no ingested record — document or episode — can claim
+  `trust: "trusted"` (`trust` is forced `untrusted` for every record).
+  Title/abstract/body are clamped to the index caps
+  (120 B / 300 B / 16 KiB). When `embed` (default `true`) is set, no
+  `vectors` were supplied and the profile has an embedder, the server
+  first asks the store which records need a vector (new id, changed
+  fingerprint or index text, or no usable stored vector) and embeds
+  only those records' index text (title + abstract + parent) in
+  batches of 16 — re-submitting an unchanged batch embeds nothing; an
+  embedding failure fails the call (retry with `embed: false` to store
+  BM25-only). Without an embedder records are stored BM25-only.
+- Result type: `MemoryIngestResult` — `{ inserted: number, updated:
+  number, unchanged: number, vectors_stored: number, embedded: number }`
+  (the `octos_memory::UpsertReport` counts plus how many vectors the
+  server actually embedded in this call — unchanged records that kept
+  their stored vector are not counted). The HNSW graph is persisted
+  before the result is sent.
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `invalid_params` per the validation above; `runtime_unavailable` as
+  for `memory/search`; `internal_error` when embedding or the index
+  write fails.
+
 #### `cron/list`
 
 - Gate: `auxiliary.rest_to_ws.v1`
@@ -1992,6 +2131,13 @@ Capability feature:
 
 Carries task lifecycle and summary updates that are useful to clients even before the full unified ledger exists.
 
+Optional fields (#1595):
+
+- `started_at`
+  Server clock timestamp of task registration (ISO-8601 / RFC 3339, same wire form as the `task/list` projection field of the same name). Clients ranking rows that share one `tool_call_id` (pipeline families, relaunch chains) order by this server timestamp, not by client receipt time. Absent on synthetic / legacy emitters.
+- `relaunched_from`
+  First-class relaunch lineage: the predecessor task id when this task was created by `TaskSupervisor::relaunch`. Unlike the JSON stamped into `runtime_detail` on the spawn transition (dropped by the next runtime-state overwrite), this field rides every frame, so clients can resolve the chain explicitly. Absent when the task is not a relaunch successor. Carried on `task/updated` only — the `task/list` projection is unchanged, so clients that need lineage outside the live stream still parse the spawn-transition `runtime_detail` JSON there.
+
 ### `task/output/delta`
 
 Carries live chunks of task output for a task/output viewer.
@@ -2095,6 +2241,29 @@ topic for client-side scoping.
 ### `turn/error`
 
 Marks the abnormal terminal event for a turn.
+
+Required fields are `session_id`, `turn_id`, `code`, and `message`; `topic` is
+optional. Provider output-limit termination uses `code: "output_truncated"`
+and remains a failure even when a real answer fragment was persisted.
+
+The additive optional fields from
+[UPCR-2026-030](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_030_INCOMPLETE_TURN_RESULTS.md)
+preserve evidence for failed turns:
+
+- `token_usage`: exact measured usage for this turn, using `EnvelopeTokenUsage`
+  counters. Unknown usage is omitted; this is never session-cumulative usage.
+- `partial_result.session_result`: a producer-authoritative `TurnSessionResult`
+  (`committed_seq`, `message_id`, optional `client_message_id`) for an actual
+  final fragment, or explicit null when there is no final answer. Absence of
+  `partial_result` means legacy/unknown identity and must not select the latest
+  pre-tool, prior-turn or background assistant row as a final fragment.
+
+The v2 `projection/envelope` representation is `turn_terminal` with
+`outcome: "errored"`, the existing `token_usage` field, and the partial marker
+at `error.data.partial_result`. Durable replay preserves the exact counters and
+object/null/absent identity distinction. The fields need no new capability;
+old errors without metadata retain their existing serialization. A second
+terminal cannot overwrite the first terminal's result or usage.
 
 ### `turn/spawn_complete`
 

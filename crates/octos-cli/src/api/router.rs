@@ -22,6 +22,7 @@ use super::events_harness;
 use super::frps_plugin;
 use super::handlers;
 use super::metrics;
+use super::pairing;
 use super::private_asr;
 use super::purge;
 use super::session_ingress;
@@ -369,6 +370,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handlers::serve_owned_site_preview_path),
         )
         .route("/api/files/list", get(handlers::list_content_files))
+        .route("/api/files/mutate", post(handlers::mutate_file))
+        .route(
+            "/api/slides/edits",
+            get(handlers::get_slide_edits).put(handlers::save_slide_edits),
+        )
         .route("/api/files/{filename}", get(handlers::serve_file))
         .route("/api/files", get(handlers::serve_file_by_query))
         // M7.9 / W2 — task supervisor exposure (kept REST). NOT an AppUI
@@ -892,6 +898,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/version", get(handlers::version))
         .route("/health", get(handlers::health));
 
+    // One-time pairing (WEB-PAIRING-CONTRACT-5100) — unauthenticated and
+    // LOOPBACK ONLY. These sit beside `/health` in the public group on
+    // purpose: they are how a local web client OBTAINS the bearer token, not
+    // a second way to bypass it — every authenticated route above keeps its
+    // middleware untouched. Both handlers answer 404 (never 403) to a
+    // non-loopback or proxied peer, and 404 when this deployment minted no
+    // code, which a client reads as "pairing not supported".
+    let pairing_routes = Router::new()
+        .route("/pair/info", get(pairing::pair_info))
+        .route("/pair/claim", post(pairing::pair_claim));
+
     // Internal endpoint for frps server plugin (no auth — called by frps on localhost)
     let internal_routes =
         Router::new().route("/api/internal/frps-auth", post(frps_plugin::frps_auth));
@@ -937,6 +954,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .merge(webhook_routes)
         .merge(version_routes)
+        .merge(pairing_routes)
         .merge(internal_routes);
 
     // Layer 1 defence for issue #995 — the strip middleware runs OUTSIDE
@@ -1437,8 +1455,18 @@ mod tests {
         });
 
         let logs = captured.as_string();
-        assert_eq!(logs.matches("path=/api/ui-protocol/ws").count(), 2);
-        assert_eq!(logs.matches("token_present=true").count(), 2);
+        // #2276: on failure print the FULL captured logs — the flake's
+        // evidence (span death) is invisible without them.
+        assert_eq!(
+            logs.matches("path=/api/ui-protocol/ws").count(),
+            2,
+            "logs:\n{logs}"
+        );
+        assert_eq!(
+            logs.matches("token_present=true").count(),
+            2,
+            "logs:\n{logs}"
+        );
         assert!(!logs.contains(query));
         assert!(!logs.contains(token));
         assert!(!logs.contains("synthetic-sensitive-marker"));
@@ -1477,6 +1505,12 @@ mod tests {
             .unwrap();
 
         tracing::subscriber::with_default(subscriber, || {
+            // #2276: this shared debug_span! callsite may have been lazily
+            // registered by a no-subscriber sibling test first (the JustOne
+            // rebuilder only asks the current thread's default), leaving a
+            // stale NEVER in the interest cache. Force a rebuild so the
+            // victim's DEBUG span is re-asked under this subscriber.
+            tracing_core::callsite::rebuild_interest_cache();
             runtime.block_on(async {
                 for uri in [
                     "/api/ui-protocol/ws?token=synthetic-query-marker%21&feature=chat",

@@ -363,6 +363,15 @@ impl GatewayRuntime {
             config.hooks = resolved.config.hooks.clone();
             config.memory = resolved.config.memory.clone();
             config.approval_policy = resolved.config.approval_policy.clone();
+            // #2217: thread the inherited tool_policy too — the ConfigWatcher
+            // seed (below) is this flattened `config`, while `parse_first`
+            // re-layers defaults on every edit; a mismatch here would make a
+            // tool_policy-only defaults inheritance look like a policy edit
+            // and emit a spurious restart-required signal. ProfileRuntime
+            // already enforces the resolved policy, so this only aligns the
+            // seed with what runs. Pinned by
+            // config_watcher::tests::inherited_tool_policy_does_not_spuriously_restart_on_unrelated_edit.
+            config.tool_policy = resolved.config.tool_policy.clone();
             // OR-merge signing so neither the env-forced host policy (already
             // merged into `config.plugins` above) nor a defaults signing floor
             // is dropped.
@@ -552,6 +561,18 @@ impl GatewayRuntime {
             );
             eprintln!("[gateway] memory store opened");
             store
+        };
+        let recall: Arc<octos_memory::RecallStore> = if let Some(rt) = profile_runtime.as_ref() {
+            rt.recall.clone()
+        } else {
+            let embedder_for_recall = create_embedder(&config);
+            crate::runtime::profile::open_recall_store(
+                &data_dir,
+                &config,
+                embedder_for_recall.as_deref(),
+            )
+            .await
+            .wrap_err("failed to open recall store")?
         };
 
         // Derive project_dir from octos_home (when launched by process_manager)
@@ -1176,7 +1197,18 @@ impl GatewayRuntime {
             }
 
             // Memory bank tools
-            tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
+            tools.register(
+                octos_agent::RecallMemoryTool::new(memory_store.clone())
+                    .with_recall(recall.clone(), gateway_embedder.clone()),
+            );
+            tools.register(octos_agent::MemorySearchTool::new(
+                recall.clone(),
+                gateway_embedder.clone(),
+            ));
+            tools.register(octos_agent::MemoryLoadTool::new(
+                recall.clone(),
+                memory_store.clone(),
+            ));
             tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
             tools.register(octos_agent::RecordMemoryUseTool::new(memory_store.clone()));
             if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
@@ -1415,6 +1447,7 @@ impl GatewayRuntime {
             // threads the profile's `lane_routing` field.
             lane_routing: None,
             memory_store: Some(memory_store.clone()),
+            recall: Some(recall.clone()),
             // Codex round-2 MAJOR 3 (PR #1327 review): the top-level
             // gateway actor factory is the "admin" path that dispatches
             // by detected profile through `profile_factory.rs`. It
@@ -1456,6 +1489,7 @@ impl GatewayRuntime {
                     tool_config: tool_config.clone(),
                     memory: memory.clone(),
                     memory_store: memory_store.clone(),
+                    recall: recall.clone(),
                     agent_config: actor_factory.agent_config.clone(),
                     session_mgr: session_mgr.clone(),
                     out_tx: out_tx.clone(),

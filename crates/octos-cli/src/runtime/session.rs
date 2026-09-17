@@ -161,7 +161,8 @@ impl SessionRuntime {
     ///    This is the M11 fix for the
     ///    `"workspace policy not found"` failure observed on
     ///    yangmi voice clone.
-    /// 3. Create `<workspace_root>/skill-output/` (plugin work dir).
+    /// 3. Resolve the plugin work dir without creating it. Plugin execution
+    ///    creates it on demand; read-only sessions use the profile data dir.
     /// 4. Clone `profile.tool_specs` via
     ///    `ToolRegistry::snapshot_excluding(&[])` and bind it to
     ///    the per-session workspace + output-dir hint.
@@ -304,7 +305,9 @@ impl SessionRuntime {
             bootstrap_session_policy(&workspace_root)?;
         }
 
-        // Step 3: plugin work dir.
+        // Step 3: resolve the plugin work dir without materializing it.
+        // PluginTool::execute creates its effective work dir before spawning,
+        // so sessions that never invoke a plugin leave no unused output dir.
         let plugin_work_dir = if permissions.file_access.allows_write() {
             workspace_root.join("skill-output")
         } else {
@@ -323,12 +326,6 @@ impl SessionRuntime {
                 .join(octos_bus::session::encode_path_component(&session_key.0))
                 .join("skill-output")
         };
-        std::fs::create_dir_all(&plugin_work_dir).wrap_err_with(|| {
-            format!(
-                "create plugin work dir failed: {}",
-                plugin_work_dir.display()
-            )
-        })?;
 
         // Step 4: clone the profile tool registry and ACTUALLY rebind
         // it to this session's workspace. `set_workspace_root` only
@@ -597,7 +594,8 @@ impl SessionRuntime {
         // session from ToolContext::parent_session_key — thread it on the
         // runtime-held agent exactly like the per-turn AppUI rebuild does.
         .with_parent_session_key(session_key.to_string())
-        .with_workspace_root(workspace_root.clone());
+        .with_workspace_root(workspace_root.clone())
+        .with_recall(profile.recall.clone());
 
         if let Some(coding_profile) = profile.agent_profile.clone() {
             let definitions = Arc::new(octos_agent::agents::AgentDefinitions::load_dir(
@@ -650,11 +648,14 @@ impl SessionRuntime {
         // at session bootstrap. Default-on makes disabled an explicit
         // opt-out.
         if profile.memory_refresh_enabled {
-            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
-                profile.memory_store.clone(),
-                profile.memory_inject_tokens,
-                true,
-            )));
+            agent.add_prompt_segment_provider(Arc::new(
+                octos_agent::MemorySegmentProvider::new(
+                    profile.memory_store.clone(),
+                    profile.memory_inject_tokens,
+                    true,
+                )
+                .with_recall(profile.recall.clone(), profile.embedder.clone()),
+            ));
         }
         // Post-memory half AFTER the named segment — the pre-refactor
         // order (memory before skills/tool guidance).
@@ -1211,6 +1212,49 @@ mod tests {
             "a read-only frontend must not create workspace policy or plugin scratch files"
         );
         assert!(runtime.plugin_work_dir.starts_with(data.path()));
+        assert!(!runtime.plugin_work_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn writable_session_bootstrap_keeps_skill_output_lazy_and_preserves_artifacts() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = make_profile(data.path().to_owned()).await;
+        let key = SessionKey::new("cli", "lazy-skill-output");
+        let runtime = SessionRuntime::bootstrap_with_permissions(
+            &profile,
+            key.clone(),
+            Some(workspace.path().to_owned()),
+            EffectivePermissions::workspace_write(),
+        )
+        .await
+        .unwrap();
+        let output_dir = runtime.workspace_root.join("skill-output");
+        assert_eq!(runtime.plugin_work_dir, output_dir);
+        assert!(runtime.workspace_root.join(WORKSPACE_POLICY_FILE).is_file());
+        assert!(
+            !output_dir.exists(),
+            "bootstrap must not create skill-output"
+        );
+
+        // Existing output stays at the same path when the session reopens.
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let artifact = output_dir.join("report.md");
+        std::fs::write(&artifact, "existing report").unwrap();
+        drop(runtime);
+        let reopened = SessionRuntime::bootstrap_with_permissions(
+            &profile,
+            key,
+            Some(workspace.path().to_owned()),
+            EffectivePermissions::workspace_write(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reopened.plugin_work_dir, output_dir);
+        assert_eq!(
+            std::fs::read_to_string(artifact).unwrap(),
+            "existing report"
+        );
     }
 
     #[test]
@@ -1329,6 +1373,10 @@ tools = ["read_file"]
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
+        let recall = Arc::new(
+            octos_memory::RecallStore::open(&data_dir, octos_memory::RecallConfig::default())
+                .unwrap(),
+        );
         let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
         let base_tools =
             ToolRegistry::with_builtins_and_sandbox(&data_dir, create_sandbox(&sandbox));
@@ -1369,6 +1417,7 @@ tools = ["read_file"]
             system_prompt,
             memory,
             memory_store,
+            recall,
             embedder: None,
             memory_inject_tokens: 2500,
             memory_refresh_enabled: true,
@@ -1733,9 +1782,9 @@ tools = ["read_file"]
         let expected_policy = WorkspacePolicy::for_session();
         assert_eq!(loaded, expected_policy);
 
-        // Plugin work dir is created and lives under workspace root.
-        assert!(rt.plugin_work_dir.is_dir());
-        assert!(rt.plugin_work_dir.starts_with(&rt.workspace_root));
+        // Resolving the output path must not create an unused directory.
+        assert_eq!(rt.plugin_work_dir, rt.workspace_root.join("skill-output"));
+        assert!(!rt.plugin_work_dir.exists());
     }
 
     #[tokio::test]
@@ -2120,6 +2169,10 @@ tools = ["read_file"]
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
+        let recall = Arc::new(
+            octos_memory::RecallStore::open(&data_dir, octos_memory::RecallConfig::default())
+                .unwrap(),
+        );
         let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
         let sandbox = SandboxConfig::default();
         let base_tools =
@@ -2161,6 +2214,7 @@ tools = ["read_file"]
             },
             memory,
             memory_store,
+            recall,
             embedder: None,
             memory_inject_tokens: 2500,
             memory_refresh_enabled: true,

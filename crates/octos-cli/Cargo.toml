@@ -40,6 +40,9 @@ async-trait = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 dirs = { workspace = true }
+# Strip the `\\?\` prefix std::fs::canonicalize returns on Windows; the prefix
+# breaks downstream tools (git treats it as a URL). Same use as octos-agent.
+dunce = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 colored = { workspace = true }
@@ -148,7 +151,10 @@ keyring = { workspace = true, features = ["windows-native"] }
 [features]
 # chat, ACP and serve use one OUP dispatcher. Minimal library builds can opt
 # out, but never silently fall back to independent chat/ACP agent loops.
-default = ["api"]
+# `embed-llama` is on by default: the in-process EmbeddingGemma embedder
+# behind memory search (docs/adr/personal-memory-tiers.md). Building it needs
+# cmake + a C++ toolchain; `--no-default-features --features api` opts out.
+default = ["api", "embed-llama"]
 # In-process llama.cpp GGUF embedding provider. Wires
 # `embedding.provider = "llamacpp"` in create_embedder. Cross-platform — no
 # target gate — and defaults to the CPU backend; add an accelerator explicitly.
@@ -188,6 +194,7 @@ audio_mp3 = ["octos-agent/audio_mp3"]
 workspace = true
 
 [dev-dependencies]
+tracing-core = "0.1.36"
 tokio-test = { workspace = true }
 tower = { workspace = true }
 axum = { workspace = true }
@@ -195,6 +202,10 @@ axum = { workspace = true }
 # failover-surfacing tests can call `publish_failover_for_subscribers`.
 # Production builds don't see this; only `cargo test -p octos-cli`.
 octos-llm = { workspace = true, features = ["test-utils"] }
+# #2353 — exposes octos-agent's test-only liveness probes (e.g.
+# `on_restore_slot_alive_probe_for_test`) to octos-cli's tests. Production
+# builds don't see this; only `cargo test -p octos-cli`.
+octos-agent = { workspace = true, features = ["test-utils"] }
 # Exposes `octos-store`'s test-only helpers (e.g. `read_audit_lines`, reached via
 # the `api::ui_protocol_audit` alias) to octos-cli's tests. Production builds
 # don't see it; only `cargo test -p octos-cli`.
